@@ -50,7 +50,7 @@ Expected: all source files copied except excluded directories/files.
 - [ ] **Step 2: Remove any stale secrets from copied files**
 
 ```bash
-grep -R "dallashudugaru@gmail.com\|postgres.zqpdpbyxohqthoikzotv\|mbik odvh oiax fuaa\|dbp-nY5Dapfh5otlx2T9MPFA" "$DEST" --include="*.py" --include="*.toml" --include="*.md" || echo "No leaked secrets found"
+grep -R "<old-zelle-email@example.com>\|<old-project-ref>\|<old-app-password>\|<old-admin-password>" "$DEST" --include="*.py" --include="*.toml" --include="*.md" || echo "No leaked secrets found"
 ```
 
 Expected: the grep returns no matches (or only the safe example file after it is rewritten in Task 2).
@@ -247,7 +247,7 @@ MAX_TICKETS_PER_REGISTRATION = 100
 
 Old:
 ```python
-_DEFAULT_ZELLE = "dallashudugaru@gmail.com"
+_DEFAULT_ZELLE = "<old-zelle-email@example.com>"
 ```
 
 New:
@@ -310,7 +310,7 @@ Generic event registration and check-in, built with **Streamlit** and hosted fre
 
 Old:
 ```markdown
-- **Payment:** Zelle → `dallashudugaru@gmail.com` · $30 per ticket, $29 for 10+, $28 for 20+ · 225 tickets total
+- **Payment:** Zelle → `<old-zelle-email@example.com>` · $30 per ticket, $29 for 10+, $28 for 20+ · 225 tickets total
 ```
 
 New:
@@ -342,7 +342,7 @@ New table:
 
 Old:
 ```toml
-ZELLE_INFO = "dallashudugaru@gmail.com"
+ZELLE_INFO = "<old-zelle-email@example.com>"
 ```
 
 New:
@@ -373,7 +373,7 @@ git commit -m "docs: generic README and new pricing table"
 
 Replace:
 - `Dallas Boys Party 2026` → `Generic Party`
-- `dallashudugaru@gmail.com` → `dfwygana@gmail.com`
+- `<old-zelle-email@example.com>` → `dfwygana@gmail.com`
 - `Texas Cowboys` → `Your Theme`
 
 Keep all architecture, security, and testing notes intact.
