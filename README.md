@@ -1,10 +1,10 @@
-# Party Check-In Generic
+# DFW Yakshagana Havyasis — Party Check-In
 
-Generic event registration and check-in, built with **Streamlit** and hosted free on Streamlit Community Cloud. Zelle payments, emailed QR codes, self check-in with audio announcements, and an admin dashboard.
+Event registration and check-in for **DFW Yakshagana Havyasis**, built with **Streamlit** and hosted free on Streamlit Community Cloud. Zelle payments, emailed QR codes, self check-in with audio announcements, and an admin dashboard.
 
-- **Event:** Your event name · date TBD
-- **Venue:** Your venue · address TBD
-- **Theme:** Your theme · dress code TBD
+- **Event:** DFW Yakshagana Havyasis · date TBD
+- **Venue:** DFW Metroplex · address TBD
+- **Theme:** Yakshagana · traditional attire encouraged
 - **Live app:** see Streamlit Cloud dashboard (URL kept out of this public repo to avoid crawler/bot traffic)
 - **Repo:** your-org/party-checkin-generic (branch `main`)
 - **Database:** Supabase PostgreSQL

@@ -48,8 +48,8 @@ def get_secret_int(key: str, default: int) -> int:
 
 # ── Event Details ────────────────────────────────────────────────────────────
 
-EVENT_NAME = "Generic Party"
-EVENT_TAGLINE = "Your Event Tagline"
+EVENT_NAME = "DFW Yakshagana Havyasis"
+EVENT_TAGLINE = "Promoting Yakshagana Art in North America"
 EVENT_DATE = datetime(2027, 1, 1)
 EVENT_TIME_TEXT = "TBD"
 EVENT_DATE_TEXT = "Friday, January 1, 2027"
@@ -58,14 +58,14 @@ EVENT_DATE_SHORT = "Fri, Jan 1, 2027"
 # Dress-up theme for the event. Drives the app's whole look (see theme.py) as
 # well as the badge on the hero, so guests arriving from the flyer land
 # somewhere that looks like the flyer.
-EVENT_THEME = "Your Theme"
-EVENT_THEME_NOTE = "Dress code TBD"
+EVENT_THEME = "Yakshagana"
+EVENT_THEME_NOTE = "Traditional attire encouraged"
 
 # Optional local-language tagline shown under the tagline on the hero.
 EVENT_TAGLINE_LOCAL = ""
 
-VENUE_NAME = "Your Venue"
-VENUE_ADDRESS = "Venue address TBD"
+VENUE_NAME = "DFW Metroplex Venue TBD"
+VENUE_ADDRESS = "DFW Metroplex, TX (address TBD)"
 
 APP_VERSION = "1.0-generic"
 

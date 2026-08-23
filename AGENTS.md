@@ -1,4 +1,4 @@
-# Party Check-In Generic — Project Agent Notes
+# DFW Yakshagana Havyasis — Party Check-In Agent Notes
 
 ## ⚠️ Read this first
 
