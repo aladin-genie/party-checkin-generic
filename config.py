@@ -97,7 +97,7 @@ LANDING_PAGE = "Register"
 # Optional: utils.resolve_image_src() returns "" for anything it can't
 # resolve, so blanking this (or deleting the file) makes both call sites
 # render nothing rather than break.
-EVENT_FLYER = "assets/flyer.jpg"
+EVENT_FLYER = "assets/flyer.png"
 
 
 # The gallery. Add real photos before the event. Each entry is either a
