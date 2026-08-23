@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Environment variables - NEVER commit these
+.env
+.env.*
+*.env
+
+# Database files - use Supabase/PostgreSQL in production
+instance/
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Uploads (user content)
+uploads/
+
+# Streamlit secrets (NEVER commit real secrets)
+.streamlit/secrets.toml
+!streamlit/secrets.toml.example
+
+# Local SQLite database
+party_guests.db
+*.db-journal
+
+# Streamlit cache
+.streamlit/cache/
+
+# Archive (old code)
+archive/
+
+# Screenshots (testing artifacts)
+screenshots/
+
+# Playwright MCP artifacts
+.playwright-mcp/
+
+# Test artifacts
+.pytest_cache/
+test_party.db
+e2e_results/

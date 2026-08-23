@@ -1,0 +1,28 @@
+name: Keep Supabase Active
+
+# Supabase pauses free-tier projects after 7 days with no database activity.
+# This job runs a trivial query twice a week — well inside that window — so
+# the project's inactivity timer never reaches zero.
+# Docs: https://supabase.com/docs/guides/platform/free-project-pausing
+
+on:
+  schedule:
+    - cron: '0 9 * * 0,3' # Sunday & Wednesday, 09:00 UTC
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+jobs:
+  ping-database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Query Supabase to reset the inactivity timer
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::SUPABASE_DB_URL secret is not set — see README troubleshooting section."
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+          psql "$DATABASE_URL" -c "SELECT 1;"
