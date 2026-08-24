@@ -85,6 +85,7 @@ from utils import (
 )
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
+from sqlalchemy.exc import OperationalError
 
 # We need to mock Streamlit for testing outside the app
 import unittest
@@ -2422,6 +2423,26 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(sponsors[1]["url"], "")   # plain http dropped
         self.assertEqual(sponsors[2]["url"], "https://example.com")
 
+    # ── DB outage banner ────────────────────────────────────────────────
+
+    def test_db_unavailable_banner_renders_the_message_and_never_claims_sold_out(self):
+        html_out = theme.db_unavailable_banner()
+        self.assertIn("database", html_out.lower())
+        self.assertIn(html.escape(theme.DB_UNAVAILABLE_MESSAGE), html_out)
+        self.assertIn("Organiser", html_out)  # organiser-facing hint present
+        lowered = html_out.lower()
+        self.assertNotIn("sold out", lowered)
+        self.assertNotIn("0 guests", lowered)
+
+    def test_db_unavailable_banner_escapes_the_detail(self):
+        html_out = theme.db_unavailable_banner('<script>alert("x")</script>')
+        self.assertNotIn("<script>", html_out)
+        self.assertIn("&lt;script&gt;", html_out)
+
+    def test_db_unavailable_banner_omits_detail_line_when_blank(self):
+        html_out = theme.db_unavailable_banner()
+        self.assertNotIn("Detail:", html_out)
+
     # ── Home page content: rendering ────────────────────────────────────
 
     def test_photo_gallery_and_sponsor_wall_render_nothing_when_empty(self):
@@ -3443,6 +3464,379 @@ class TestPartyCheckIn(unittest.TestCase):
                        ticket_count=2, zelle_ref="ZELLE-LEGREV001")
         stats = get_stats()
         self.assertEqual(stats["revenue"], 85.0 + 100.0)
+
+    # ── DB outage resilience (utils.db_health / degraded reads / writes still
+    # report failure) ──────────────────────────────────────────────────────
+    # Reproduces the "engine cached OK, database disappears later" incident:
+    # a real DATABASE_URL was reachable at boot (so utils.db_degraded() stays
+    # False, same as it would in production against a live Postgres that
+    # later goes away), and the failure is injected further downstream —
+    # inside get_db()/a specific call — exactly where a live outage would
+    # actually surface it. See utils.ticket_availability()'s existing
+    # test_ticket_availability_fails_open_when_the_count_raises for the same
+    # style of injection this section follows.
+
+    def test_probe_db_health_ok_against_a_working_database(self):
+        result = utils._probe_db_health()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["error"], "")
+
+    def test_probe_db_health_never_raises_when_the_engine_is_unreachable(self):
+        with patch.object(utils, "get_engine", side_effect=RuntimeError("db is gone")):
+            result = utils._probe_db_health()
+        self.assertFalse(result["ok"])
+        self.assertIn("db is gone", result["error"])
+
+    def test_db_health_ok_true_normally(self):
+        state = utils._db_health_cache_state()
+        with state["lock"]:
+            state["value"] = None
+            state["expires_at"] = 0.0
+        health = utils.db_health()
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["error"], "")
+
+    def test_db_health_reports_failure_without_raising(self):
+        # db_health() is process-global-cached (a few seconds, shared across
+        # every session, like _cached_checkin_mode()) — reset it before and
+        # after so this test's forced failure can't leak into other tests
+        # that run within the same TTL window.
+        state = utils._db_health_cache_state()
+        with state["lock"]:
+            state["value"] = None
+            state["expires_at"] = 0.0
+        try:
+            with patch.object(utils, "_probe_db_health", return_value={"ok": False, "error": "db is gone"}):
+                health = utils.db_health()
+            self.assertFalse(health["ok"])
+            self.assertEqual(health["error"], "db is gone")
+        finally:
+            with state["lock"]:
+                state["value"] = None
+                state["expires_at"] = 0.0
+
+    def test_get_stats_degrades_to_the_empty_shape_when_the_db_raises(self):
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            stats = get_stats()
+        self.assertEqual(stats, utils._EMPTY_STATS)
+
+    def test_get_site_stats_degrades_to_the_empty_shape_when_the_db_raises(self):
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            stats = utils.get_site_stats()
+        self.assertEqual(
+            stats,
+            {
+                "total_visits": 0, "unique_visitors": 0, "today_visits": 0,
+                "today_unique": 0, "total_regs": 0, "today_regs": 0,
+            },
+        )
+
+    def test_checkin_status_fails_closed_when_the_db_raises(self):
+        # Fails CLOSED (open=False), not open — an outage that also silently
+        # opened the door would let people in without a working database to
+        # ever record it.
+        with patch.object(utils, "get_checkin_mode", side_effect=RuntimeError("db down")):
+            status = checkin_status()
+        self.assertFalse(status["open"])
+        self.assertEqual(status["mode"], CHECKIN_MODE_CLOSED)
+        self.assertTrue(status["message"])
+
+    def test_list_guests_degrades_to_an_empty_list_when_the_db_raises(self):
+        self._register(name="Listed Guest", email="listed.degraded@test.com",
+                       zelle_ref="ZELLE-LISTDEG1")
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            guests = list_guests()
+        self.assertEqual(guests, [])
+
+    def test_get_recent_checkins_degrades_to_an_empty_list_when_the_db_raises(self):
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            recent = get_recent_checkins()
+        self.assertEqual(recent, [])
+
+    def test_get_registration_daily_counts_degrades_to_an_empty_list_when_the_db_raises(self):
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            counts = get_registration_daily_counts()
+        self.assertEqual(counts, [])
+
+    def test_get_event_day_hourly_checkins_degrades_to_zeros_when_the_db_raises(self):
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            hourly = get_event_day_hourly_checkins()
+        self.assertEqual(hourly, [0] * 24)
+
+    def test_get_table_counts_degrades_to_zeros_when_the_db_raises(self):
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            counts = utils.get_table_counts()
+        self.assertEqual(
+            counts, {"guests": 0, "checkin_logs": 0, "page_visits": 0, "submission_logs": 0}
+        )
+
+    def test_get_guest_and_contact_lookups_return_none_when_the_db_raises(self):
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            self.assertIsNone(get_guest(1))
+            self.assertIsNone(utils.get_guest_by_email("nobody@test.com"))
+            self.assertIsNone(utils.get_guest_by_phone("+1-555-000-1111"))
+
+    def test_find_guest_by_contact_reports_an_outage_rather_than_false_not_found(self):
+        # utils.find_guest_by_contact() checks db_health() up front precisely
+        # so it can't conflate "unreachable" with "not registered" — telling
+        # an already-paid guest to go register again during an outage risks
+        # a real duplicate booking.
+        with patch.object(utils, "db_health", return_value={"ok": False, "error": "db down"}):
+            guest, error = utils.find_guest_by_contact("someone@test.com")
+        self.assertIsNone(guest)
+        self.assertIn("temporarily unreachable", error)
+        self.assertNotIn("register first", error)
+
+    def test_find_guest_by_code_reports_db_unavailable_when_the_lookup_raises(self):
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            result = find_guest_by_code("some-code")
+        self.assertEqual(result["status"], "db_unavailable")
+        self.assertIsNone(result["guest"])
+
+    def test_record_visit_never_raises_when_the_db_raises(self):
+        with patch.object(utils, "_visit_buffer_state", side_effect=RuntimeError("db down")):
+            try:
+                record_visit("visitor-token-1", "Home")
+            except Exception as e:
+                self.fail(f"record_visit() raised instead of degrading: {e}")
+
+    def test_flush_page_visits_never_raises_when_get_db_raises(self):
+        record_visit("visitor-token-2", "Home")  # buffer at least one row
+        with patch.object(utils, "get_db", side_effect=RuntimeError("db down")):
+            try:
+                flushed = utils.flush_page_visits()
+            except Exception as e:
+                self.fail(f"flush_page_visits() raised instead of degrading: {e}")
+        self.assertEqual(flushed, 0)
+        # Re-buffered, not dropped: a normal flush afterward still saves it.
+        self.assertGreaterEqual(utils.flush_page_visits(), 1)
+
+    def test_register_guest_reports_failure_rather_than_silently_succeeding(self):
+        # register_guest() is a WRITE path — unlike the reads above, it must
+        # never swallow a mid-transaction failure into a false "ok": True.
+        with patch.object(utils, "generate_qr_code", side_effect=RuntimeError("simulated db failure")):
+            result = register_guest(
+                "DB Fail Guest", "dbfail@test.com", "+1-555-333-4444", 1, "", "ZELLE-DBFAIL01",
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "db_error")
+        session = get_db()
+        try:
+            self.assertIsNone(session.query(Guest).filter_by(email="dbfail@test.com").first())
+        finally:
+            session.close()
+
+    def test_check_in_by_code_does_not_silently_report_success_when_the_write_fails(self):
+        # check_in_by_code() is also a WRITE path. It doesn't swallow a
+        # mid-transaction failure into a fake "success" either — it
+        # propagates, which is what streamlit_app.py's Scanner call sites
+        # now catch (see _process_checkin_confirmed()) to show a calm error
+        # instead of a crash, rather than utils.py pretending the check-in
+        # went through.
+        result = self._register(name="Checkin Fail Guest", email="checkinfail@test.com",
+                                zelle_ref="ZELLE-CIFAIL01")
+        self.assertTrue(result["ok"])
+        guest = result["guest"]
+
+        with patch.object(utils, "_utc_now", side_effect=RuntimeError("simulated db failure")):
+            with self.assertRaises(RuntimeError):
+                check_in_by_code(guest["qr_code"])
+
+        fresh = get_guest(guest["id"])
+        self.assertFalse(fresh["checked_in"])
+
+    # ── WRITE paths must report failure, never raise, when get_db() itself
+    # fails (the database is completely unreachable, not just a query that
+    # fails mid-transaction) ─────────────────────────────────────────────
+    # These mirror the READ-degradation tests above, but for the write/
+    # mutation service functions: register_guest, check_in_by_code,
+    # check_in_guest, mark_band_given, delete_guest, record_submission,
+    # export_backup, reset_all_data all used to call get_db() OUTSIDE their
+    # try block, so a database that's gone by the time get_db() is called
+    # (as opposed to failing on a query once a session already exists, like
+    # the tests above this section) raised straight out of the function
+    # instead of returning its documented failure value — the guest may
+    # have already sent a Zelle payment, so crashing at submit is far worse
+    # than the read case.
+
+    def test_register_guest_returns_failure_instead_of_raising_when_db_is_gone(self):
+        with patch.object(utils, "get_db", side_effect=OperationalError("SELECT 1", {}, Exception("db down"))):
+            try:
+                result = register_guest(
+                    "Outage Guest", "outage@test.com", "+1-555-444-5555", 1, "", "ZELLE-OUTAGE01",
+                )
+            except Exception as e:
+                self.fail(f"register_guest() raised instead of returning a failure dict: {e}")
+        # Must not look like success in any way a future refactor could
+        # mistake for a real booking: ok is False and there is no "guest".
+        self.assertFalse(result["ok"])
+        self.assertNotIn("guest", result)
+        self.assertEqual(result["reason"], "db_error")
+        self.assertIsNone(utils.get_guest_by_email("outage@test.com"))
+
+    def test_check_in_by_code_returns_db_unavailable_instead_of_raising_when_db_is_gone(self):
+        reg = self._register(name="Code Outage Guest", email="codeoutage@test.com",
+                             zelle_ref="ZELLE-CODEOUT1")
+        self.assertTrue(reg["ok"])
+        guest = reg["guest"]
+
+        # bypass_window=True so this exercises get_db() failing specifically,
+        # not checkin_status() (which reads app_settings through get_db() too
+        # and already fails closed on its own — see
+        # test_checkin_status_fails_closed_when_the_db_raises above).
+        with patch.object(utils, "get_db", side_effect=OperationalError("SELECT 1", {}, Exception("db down"))):
+            try:
+                result = check_in_by_code(guest["qr_code"], bypass_window=True)
+            except Exception as e:
+                self.fail(f"check_in_by_code() raised instead of returning a failure dict: {e}")
+        self.assertEqual(result["status"], "db_unavailable")
+        self.assertIsNone(result["guest"])
+        self.assertTrue(result["message"])
+
+        fresh = get_guest(guest["id"])
+        self.assertFalse(fresh["checked_in"])
+
+    def test_check_in_guest_returns_db_unavailable_instead_of_raising_when_db_is_gone(self):
+        reg = self._register(name="Id Outage Guest", email="idoutage@test.com",
+                             zelle_ref="ZELLE-IDOUT001")
+        self.assertTrue(reg["ok"])
+        guest = reg["guest"]
+
+        with patch.object(utils, "get_db", side_effect=OperationalError("SELECT 1", {}, Exception("db down"))):
+            try:
+                result = check_in_guest(guest["id"], bypass_window=True)
+            except Exception as e:
+                self.fail(f"check_in_guest() raised instead of returning a failure dict: {e}")
+        self.assertEqual(result["status"], "db_unavailable")
+        self.assertIsNone(result["guest"])
+
+        fresh = get_guest(guest["id"])
+        self.assertFalse(fresh["checked_in"])
+
+    def test_mark_band_given_returns_failure_instead_of_raising_when_db_is_gone(self):
+        reg = self._register(name="Band Outage Guest", email="bandoutage@test.com",
+                             zelle_ref="ZELLE-BANDOUT1")
+        self.assertTrue(reg["ok"])
+        guest = reg["guest"]
+
+        with patch.object(utils, "get_db", side_effect=OperationalError("SELECT 1", {}, Exception("db down"))):
+            try:
+                result = mark_band_given(guest["id"])
+            except Exception as e:
+                self.fail(f"mark_band_given() raised instead of returning a failure dict: {e}")
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["message"])
+
+        fresh = get_guest(guest["id"])
+        self.assertFalse(fresh["band_given"])
+
+    def test_delete_guest_returns_false_instead_of_raising_when_db_is_gone(self):
+        reg = self._register(name="Delete Outage Guest", email="deloutage@test.com",
+                             zelle_ref="ZELLE-DELOUT01")
+        self.assertTrue(reg["ok"])
+        guest = reg["guest"]
+
+        with patch.object(utils, "get_db", side_effect=OperationalError("SELECT 1", {}, Exception("db down"))):
+            try:
+                result = delete_guest(guest["id"])
+            except Exception as e:
+                self.fail(f"delete_guest() raised instead of returning False: {e}")
+        self.assertFalse(result)
+        self.assertIsNotNone(get_guest(guest["id"]))
+
+    def test_record_submission_never_raises_when_db_is_gone(self):
+        with patch.object(utils, "get_db", side_effect=OperationalError("SELECT 1", {}, Exception("db down"))):
+            try:
+                outcome = record_submission(
+                    "Sub Outage", "suboutage@test.com", "", 1, "", "ZELLE-SUBOUT01",
+                    status="attempted",
+                )
+            except Exception as e:
+                self.fail(f"record_submission() raised instead of degrading: {e}")
+        self.assertIsNone(outcome)
+
+    def test_export_backup_returns_failure_instead_of_raising_when_db_is_gone(self):
+        self._seed_for_reset()
+        try:
+            with patch.object(utils, "get_db", side_effect=OperationalError("SELECT 1", {}, Exception("db down"))):
+                try:
+                    result = export_backup()
+                except Exception as e:
+                    self.fail(f"export_backup() raised instead of returning a failure dict: {e}")
+            self.assertFalse(result.get("ok", True))
+            self.assertNotIn("zip", result)
+            self.assertNotIn("counts", result)
+        finally:
+            # _seed_for_reset() buffers a page visit that a failed
+            # export_backup() (get_db() patched away) can't flush to disk —
+            # clean the slate for later tests rather than leaving it to
+            # linger in the process-global visit buffer.
+            reset_all_data()
+
+    def test_reset_all_data_returns_failure_instead_of_raising_when_db_is_gone(self):
+        self._seed_for_reset()
+        before = get_table_counts()
+        self.assertGreater(before["guests"], 0)
+
+        try:
+            with patch.object(utils, "get_db", side_effect=OperationalError("SELECT 1", {}, Exception("db down"))):
+                try:
+                    result = reset_all_data()
+                except Exception as e:
+                    self.fail(f"reset_all_data() raised instead of returning a failure dict: {e}")
+            self.assertFalse(result.get("ok", True))
+
+            # Nothing was actually deleted — a get_db() failure must not be
+            # mistaken for (or cause) a real, zero-row reset.
+            after = get_table_counts()
+            self.assertEqual(before, after)
+        finally:
+            # The "outage" reset above deliberately did not clean up
+            # _seed_for_reset()'s rows (that's the point of the test) — do
+            # it here, once the database is back, so later tests still see
+            # a clean slate the same way they would after a real reset.
+            reset_all_data()
+
+    def test_init_db_survives_a_raising_seat_numbers_migration(self):
+        # The guests.seat_numbers / submission_logs.seat_numbers ALTER TABLE
+        # migrations in init_db() used to be the only ones NOT wrapped in
+        # try/except, unlike plus_one_name's widen just below them. Fakes a
+        # live database where those columns are still missing (via a
+        # wrapped inspector) and where the ALTER itself blows up (via a
+        # patched Connection.execute) — init_db() must log and continue
+        # rather than letting that abort the whole boot sequence.
+        from sqlalchemy import inspect as real_inspect_fn
+        from sqlalchemy.engine import Connection
+
+        class _FakeInspector:
+            def __init__(self, real):
+                self._real = real
+
+            def get_table_names(self):
+                return self._real.get_table_names()
+
+            def get_columns(self, table_name):
+                cols = self._real.get_columns(table_name)
+                if table_name in ("guests", "submission_logs"):
+                    cols = [c for c in cols if c["name"] != "seat_numbers"]
+                return cols
+
+        def fake_inspect(engine_arg):
+            return _FakeInspector(real_inspect_fn(engine_arg))
+
+        original_execute = Connection.execute
+
+        def raising_execute(self_conn, statement, *args, **kwargs):
+            if "ADD COLUMN seat_numbers" in str(statement):
+                raise RuntimeError("simulated ALTER TABLE failure")
+            return original_execute(self_conn, statement, *args, **kwargs)
+
+        with patch.object(utils, "inspect", side_effect=fake_inspect), \
+             patch.object(Connection, "execute", raising_execute):
+            try:
+                utils.init_db()
+            except Exception as e:
+                self.fail(f"init_db() raised despite the seat_numbers migration being wrapped: {e}")
 
 
 def run_tests():

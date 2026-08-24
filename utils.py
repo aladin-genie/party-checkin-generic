@@ -327,6 +327,88 @@ DB_DEGRADED_MESSAGE = (
 )
 
 
+# ── DB Health Probe ──────────────────────────────────────────────────────────
+# db_degraded() (above) only catches ONE failure mode: the configured
+# DATABASE_URL was unreachable at the moment _get_engine_cached() first ran,
+# so it fell back to local SQLite. It says nothing about the far more common
+# production incident: the engine connected fine at boot, @st.cache_resource
+# cached it, and Supabase went away sometime *after* — a paused project, a
+# network blip, pooler connection limits exhausted. Every query against that
+# still-cached engine then raises OperationalError, and nothing re-validates
+# it. db_health() is the cheap, repeatable check that actually notices that
+# case: a live SELECT 1, on every call (subject to the short memo below), so
+# a page can tell "the database just died" from "everything is fine" on its
+# very next render.
+_DB_HEALTH_CACHE_TTL_SECONDS = 5
+
+
+@st.cache_resource(show_spinner=False)
+def _db_health_cache_state() -> dict:
+    """Process-global cache for db_health(), shared across sessions.
+
+    Mirrors _checkin_mode_cache_state()'s shape exactly:
+    {"value": dict|None, "expires_at": float (time.monotonic()), "lock":
+    threading.Lock()}. `value` is None whenever the cache is cold.
+    """
+    return {"value": None, "expires_at": 0.0, "lock": threading.Lock()}
+
+
+def _probe_db_health() -> dict:
+    """Uncached SELECT 1 against the current engine. Never raises.
+
+    Split out from db_health() so a test can exercise the probe itself
+    without fighting the process-global memo below.
+
+    Returns {"ok": bool, "error": str}. `error` is a short, single-line
+    str(exception) (truncated) — deliberately NEVER the DSN or password.
+    SQLAlchemy/driver failures here are connection errors (timeouts, refused
+    connections, auth failures), not string-built from the URL, so
+    str(exception) alone is safe the same way the rest of this file's
+    "log safe diagnostics (driver only, never the password)" logging is
+    (see _get_engine_cached()) — the full exception still goes to the
+    server log for the organiser, never into the returned/displayed value.
+    """
+    try:
+        engine = get_engine()
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return {"ok": True, "error": ""}
+    except Exception as e:
+        print(f"utils.db_health probe failed: {e}")
+        short = str(e).strip().splitlines()[0] if str(e).strip() else e.__class__.__name__
+        return {"ok": False, "error": short[:160]}
+
+
+def db_health() -> dict:
+    """Cheap, actively-refreshed database health check for page renders.
+
+    Returns {"ok": bool, "error": str}. Must never raise — every page calls
+    this on every render (see streamlit_app.main()) to decide whether to
+    show theme.db_unavailable_banner(), so a probe that itself blew up would
+    defeat the entire point.
+
+    Cached for a few seconds, process-global, shared across every session —
+    same pattern as _cached_checkin_mode()/_checkin_mode_cache_state() just
+    above check_in_by_code()'s hot path, for the same reason: called on
+    essentially every render across every connected browser, so an
+    uncached round trip per widget interaction would add real latency (and
+    real load on an already-struggling database) for no benefit — the
+    health picture only needs to be a few seconds fresh, not instantaneous.
+    """
+    state = _db_health_cache_state()
+    now = time.monotonic()
+    with state["lock"]:
+        if state["value"] is not None and now < state["expires_at"]:
+            return state["value"]
+
+    value = _probe_db_health()
+
+    with state["lock"]:
+        state["value"] = value
+        state["expires_at"] = time.monotonic() + _DB_HEALTH_CACHE_TTL_SECONDS
+    return value
+
+
 @st.cache_resource(show_spinner=False)
 def get_session_factory():
     """Create a cached session factory."""
@@ -433,10 +515,20 @@ def init_db():
                 conn.execute(text("ALTER TABLE guests ADD COLUMN non_veg_count INTEGER DEFAULT 0"))
                 conn.commit()
         if "seat_numbers" not in cols:
+            # Unlike the ALTERs above, this one is wrapped: it's the newest
+            # of the bunch, and a failure here on the live Postgres database
+            # (e.g. a lock held by another connection, a permissions quirk)
+            # must not be allowed to abort the whole boot sequence — every
+            # migration below it, and the app itself, still needs to start.
+            # Mirrors the plus_one_name widen's "log and continue" pattern
+            # further down.
             from sqlalchemy import text
-            with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE guests ADD COLUMN seat_numbers VARCHAR(512) DEFAULT ''"))
-                conn.commit()
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE guests ADD COLUMN seat_numbers VARCHAR(512) DEFAULT ''"))
+                    conn.commit()
+            except Exception as e:
+                print(f"Migration skipped: add guests.seat_numbers: {e}")
 
     # Migration for existing submission_logs tables that pre-date the meal
     # count columns — mirrors the guests-table blocks above.
@@ -453,10 +545,17 @@ def init_db():
                 conn.execute(text("ALTER TABLE submission_logs ADD COLUMN non_veg_count INTEGER DEFAULT 0"))
                 conn.commit()
         if "seat_numbers" not in sub_cols:
+            # Wrapped for the same reason as guests.seat_numbers above: this
+            # is the newer of the two ALTERs and, unlike its siblings here,
+            # was not yet guarded — a failure must not be allowed to break
+            # boot against the live database.
             from sqlalchemy import text
-            with engine.connect() as conn:
-                conn.execute(text("ALTER TABLE submission_logs ADD COLUMN seat_numbers VARCHAR(512) DEFAULT ''"))
-                conn.commit()
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE submission_logs ADD COLUMN seat_numbers VARCHAR(512) DEFAULT ''"))
+                    conn.commit()
+            except Exception as e:
+                print(f"Migration skipped: add submission_logs.seat_numbers: {e}")
 
     # Widen plus_one_name to fit a full bulk guest-name list. The target width
     # is GUEST_NAMES_MAX_CHARS, derived from config.MAX_TICKETS_PER_REGISTRATION,
@@ -653,28 +752,46 @@ def checkin_status(use_cache: bool = False) -> dict:
     that actually benefits from not hitting app_settings every time. Either
     way, the "auto" mode's open/closed transition is computed fresh against
     _utc_now() on every call, so the event-time window itself is never stale.
+
+    Must never raise. In practice get_checkin_mode() already can't raise
+    from a DB failure (get_setting() catches its own exceptions and returns
+    the "auto" default) — this wraps the whole body anyway as defense in
+    depth, since check_in_by_code() trusts this to decide whether it's even
+    allowed to attempt a lookup. On any failure this fails CLOSED (open=
+    False) rather than open: an outage that also silently opened the door
+    would let people in without a working database to record it.
     """
-    mode = _cached_checkin_mode() if use_cache else get_checkin_mode()
-    opens_at_utc = config.checkin_opens_at_utc()
-    opens_at_text = config.checkin_opens_at_text()
+    try:
+        mode = _cached_checkin_mode() if use_cache else get_checkin_mode()
+        opens_at_utc = config.checkin_opens_at_utc()
+        opens_at_text = config.checkin_opens_at_text()
 
-    if mode == CHECKIN_MODE_OPEN:
-        is_open = True
-        message = ""
-    elif mode == CHECKIN_MODE_CLOSED:
-        is_open = False
-        message = "Check-in is currently closed by the organiser."
-    else:  # CHECKIN_MODE_AUTO
-        is_open = _utc_now() >= opens_at_utc
-        message = "" if is_open else f"Check-in opens {opens_at_text}."
+        if mode == CHECKIN_MODE_OPEN:
+            is_open = True
+            message = ""
+        elif mode == CHECKIN_MODE_CLOSED:
+            is_open = False
+            message = "Check-in is currently closed by the organiser."
+        else:  # CHECKIN_MODE_AUTO
+            is_open = _utc_now() >= opens_at_utc
+            message = "" if is_open else f"Check-in opens {opens_at_text}."
 
-    return {
-        "open": is_open,
-        "mode": mode,
-        "opens_at_utc": opens_at_utc,
-        "opens_at_text": opens_at_text,
-        "message": message,
-    }
+        return {
+            "open": is_open,
+            "mode": mode,
+            "opens_at_utc": opens_at_utc,
+            "opens_at_text": opens_at_text,
+            "message": message,
+        }
+    except Exception as e:
+        print(f"utils.checkin_status unavailable, failing closed: {e}")
+        return {
+            "open": False,
+            "mode": CHECKIN_MODE_CLOSED,
+            "opens_at_utc": None,
+            "opens_at_text": "",
+            "message": "Check-in status can't be confirmed right now — the guest database is unreachable.",
+        }
 
 
 # ── Capacity Guard ────────────────────────────────────────────────────────────
@@ -817,6 +934,22 @@ def _expected_revenue_cents(session) -> int:
     return total_cents
 
 
+_EMPTY_STATS = {
+    "total_guests": 0,
+    "checked_in": 0,
+    "bands_distributed": 0,
+    "pending": 0,
+    "total_tickets": 0,
+    "admitted_tickets": 0,
+    "plus_one_count": 0,
+    "named_guests": 0,
+    "unnamed_tickets": 0,
+    "avg_tickets_per_guest": 0.0,
+    "checkin_percentage": 0.0,
+    "revenue": 0.0,
+}
+
+
 def get_stats() -> dict:
     """Return current event statistics.
 
@@ -835,61 +968,73 @@ def get_stats() -> dict:
     and unnamed_tickets is the gap between the two — non-zero only for
     bookings made before guest names were required, since
     validate_registration() now refuses a mismatch.
+
+    Must never raise: read on nearly every page render, so a DB outage
+    degrades to _EMPTY_STATS (every count zeroed) instead of taking the
+    page down — same "fail to the documented empty shape" contract as
+    ticket_availability()/seat_availability(), just applied to a plain
+    read. An all-zero result during an outage is display-only; pages must
+    pair it with db_health() (see streamlit_app.py) rather than presenting
+    zeros as a real headcount.
     """
-    session = get_db()
     try:
-        row = session.query(
-            func.count(Guest.id),
-            func.coalesce(func.sum(case((Guest.checked_in == True, 1), else_=0)), 0),
-            func.coalesce(func.sum(case((Guest.band_given == True, 1), else_=0)), 0),
-            func.coalesce(func.sum(Guest.ticket_count), 0),
-            func.coalesce(
-                func.sum(case((Guest.checked_in == True, Guest.ticket_count), else_=0)), 0
-            ),
-            func.coalesce(func.sum(case((Guest.plus_one_name != "", 1), else_=0)), 0),
-            func.coalesce(func.sum(_named_guests_expr()), 0),
-        ).one()
+        session = get_db()
+        try:
+            row = session.query(
+                func.count(Guest.id),
+                func.coalesce(func.sum(case((Guest.checked_in == True, 1), else_=0)), 0),
+                func.coalesce(func.sum(case((Guest.band_given == True, 1), else_=0)), 0),
+                func.coalesce(func.sum(Guest.ticket_count), 0),
+                func.coalesce(
+                    func.sum(case((Guest.checked_in == True, Guest.ticket_count), else_=0)), 0
+                ),
+                func.coalesce(func.sum(case((Guest.plus_one_name != "", 1), else_=0)), 0),
+                func.coalesce(func.sum(_named_guests_expr()), 0),
+            ).one()
 
-        total = int(row[0])
-        checked_in = int(row[1])
-        bands = int(row[2])
-        tickets = int(row[3])
-        admitted_tickets = int(row[4])
-        plus_one_count = int(row[5])
-        named_guests = int(row[6])
-        # Clamped: a row hand-edited to name more people than it has tickets
-        # would otherwise report a negative gap.
-        unnamed_tickets = max(tickets - total - named_guests, 0)
+            total = int(row[0])
+            checked_in = int(row[1])
+            bands = int(row[2])
+            tickets = int(row[3])
+            admitted_tickets = int(row[4])
+            plus_one_count = int(row[5])
+            named_guests = int(row[6])
+            # Clamped: a row hand-edited to name more people than it has
+            # tickets would otherwise report a negative gap.
+            unnamed_tickets = max(tickets - total - named_guests, 0)
 
-        # Average tickets per guest
-        avg_tickets = round(tickets / total, 2) if total else 0.0
+            # Average tickets per guest
+            avg_tickets = round(tickets / total, 2) if total else 0.0
 
-        # Check-in percentage
-        checkin_pct = round(checked_in / total * 100, 1) if total else 0.0
+            # Check-in percentage
+            checkin_pct = round(checked_in / total * 100, 1) if total else 0.0
 
-        # Estimated revenue. Not tickets × one price: each booking is priced
-        # by its own seats (seat-picking bookings) or its own size (legacy
-        # bookings) — see _expected_revenue_cents — so a flat multiply would
-        # over-report what the organiser should actually find in their Zelle
-        # history.
-        revenue = round(_expected_revenue_cents(session) / 100, 2)
+            # Estimated revenue. Not tickets × one price: each booking is
+            # priced by its own seats (seat-picking bookings) or its own
+            # size (legacy bookings) — see _expected_revenue_cents — so a
+            # flat multiply would over-report what the organiser should
+            # actually find in their Zelle history.
+            revenue = round(_expected_revenue_cents(session) / 100, 2)
 
-        return {
-            "total_guests": total,
-            "checked_in": checked_in,
-            "bands_distributed": bands,
-            "pending": total - checked_in,
-            "total_tickets": tickets,
-            "admitted_tickets": admitted_tickets,
-            "plus_one_count": plus_one_count,
-            "named_guests": named_guests,
-            "unnamed_tickets": unnamed_tickets,
-            "avg_tickets_per_guest": avg_tickets,
-            "checkin_percentage": checkin_pct,
-            "revenue": revenue,
-        }
-    finally:
-        session.close()
+            return {
+                "total_guests": total,
+                "checked_in": checked_in,
+                "bands_distributed": bands,
+                "pending": total - checked_in,
+                "total_tickets": tickets,
+                "admitted_tickets": admitted_tickets,
+                "plus_one_count": plus_one_count,
+                "named_guests": named_guests,
+                "unnamed_tickets": unnamed_tickets,
+                "avg_tickets_per_guest": avg_tickets,
+                "checkin_percentage": checkin_pct,
+                "revenue": revenue,
+            }
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.get_stats unavailable, returning zeros: {e}")
+        return dict(_EMPTY_STATS)
 
 
 # ── Ticket Capacity ───────────────────────────────────────────────────────────
@@ -1102,22 +1247,31 @@ def record_visit(visitor_token: str, page: str = "Home") -> None:
     Call flush_page_visits() to force a synchronous flush; the stats readers
     below do this first so callers (including tests) always see up-to-date
     numbers, never a stale pre-flush count.
-    """
-    state = _visit_buffer_state()
-    should_flush = False
-    with state["lock"]:
-        state["rows"].append(
-            {"visitor_token": visitor_token, "page": page, "visited_at": _utc_now()}
-        )
-        elapsed = time.monotonic() - state["last_flush"]
-        if (
-            len(state["rows"]) >= _VISIT_BUFFER_FLUSH_THRESHOLD
-            or elapsed >= _VISIT_BUFFER_FLUSH_INTERVAL_SECONDS
-        ):
-            should_flush = True
 
-    if should_flush:
-        threading.Thread(target=_flush_page_visits_worker, daemon=True).start()
+    Must never raise: called on essentially every page render (see
+    streamlit_app.main()). The append itself never touches the database, so
+    this is already safe in practice, but the whole body is still wrapped
+    defensively — a busy hall full of guests reloading a dead page is a far
+    worse outcome than one dropped visit-count row.
+    """
+    try:
+        state = _visit_buffer_state()
+        should_flush = False
+        with state["lock"]:
+            state["rows"].append(
+                {"visitor_token": visitor_token, "page": page, "visited_at": _utc_now()}
+            )
+            elapsed = time.monotonic() - state["last_flush"]
+            if (
+                len(state["rows"]) >= _VISIT_BUFFER_FLUSH_THRESHOLD
+                or elapsed >= _VISIT_BUFFER_FLUSH_INTERVAL_SECONDS
+            ):
+                should_flush = True
+
+        if should_flush:
+            threading.Thread(target=_flush_page_visits_worker, daemon=True).start()
+    except Exception as e:
+        print(f"utils.record_visit failed, dropping this visit: {e}")
 
 
 def _flush_page_visits_worker() -> None:
@@ -1150,7 +1304,9 @@ def flush_page_visits() -> int:
 
     Never raises into the caller: if the bulk insert fails, the rows are
     logged and put back at the front of the buffer (not silently dropped)
-    so the next flush attempt retries them.
+    so the next flush attempt retries them. Also true if get_db() itself
+    fails (e.g. the engine's connection pool is exhausted against a
+    database that just disappeared) — that used to be unguarded here.
     """
     state = _visit_buffer_state()
     with state["lock"]:
@@ -1161,7 +1317,14 @@ def flush_page_visits() -> int:
     if not rows:
         return 0
 
-    session = get_db()
+    try:
+        session = get_db()
+    except Exception as e:
+        print(f"flush_page_visits: get_db() failed, re-buffering {len(rows)} row(s): {e}")
+        with state["lock"]:
+            state["rows"] = rows + state["rows"]
+        return 0
+
     try:
         session.execute(insert(PageVisit), rows)
         session.commit()
@@ -1215,54 +1378,72 @@ def get_site_stats() -> dict:
     _local_day_utc_bounds() converts today's LOCAL midnight->midnight
     window to UTC once, so the range filters below stay correct even though
     the underlying columns are UTC and SQL can't run a per-row conversion.
+
+    Must never raise: rendered on the Home page's "Community Buzz" section
+    on nearly every render. Degrades to all-zero counts on a DB outage —
+    the caller (streamlit_app.page_home()) checks db_health() itself and
+    hides this section entirely rather than showing zeros as if they were
+    real, so this contract only has to guarantee "never crash", not "never
+    lie" on its own.
     """
-    flush_page_visits()
-    session = get_db()
     try:
-        today_start_utc, today_end_utc = _local_day_utc_bounds(to_event_local(_utc_now()).date())
+        flush_page_visits()
+        session = get_db()
+        try:
+            today_start_utc, today_end_utc = _local_day_utc_bounds(to_event_local(_utc_now()).date())
 
-        total_visits_sq = select(func.count(PageVisit.id)).scalar_subquery()
-        unique_visitors_sq = select(
-            func.count(func.distinct(PageVisit.visitor_token))
-        ).scalar_subquery()
-        today_visits_sq = (
-            select(func.count(PageVisit.id))
-            .where(PageVisit.visited_at >= today_start_utc, PageVisit.visited_at < today_end_utc)
-            .scalar_subquery()
-        )
-        today_unique_sq = (
-            select(func.count(func.distinct(PageVisit.visitor_token)))
-            .where(PageVisit.visited_at >= today_start_utc, PageVisit.visited_at < today_end_utc)
-            .scalar_subquery()
-        )
-        total_regs_sq = select(func.coalesce(func.sum(Guest.ticket_count), 0)).scalar_subquery()
-        today_regs_sq = (
-            select(func.coalesce(func.sum(Guest.ticket_count), 0))
-            .where(Guest.created_at >= today_start_utc, Guest.created_at < today_end_utc)
-            .scalar_subquery()
-        )
-
-        row = session.execute(
-            select(
-                total_visits_sq.label("total_visits"),
-                unique_visitors_sq.label("unique_visitors"),
-                today_visits_sq.label("today_visits"),
-                today_unique_sq.label("today_unique"),
-                total_regs_sq.label("total_regs"),
-                today_regs_sq.label("today_regs"),
+            total_visits_sq = select(func.count(PageVisit.id)).scalar_subquery()
+            unique_visitors_sq = select(
+                func.count(func.distinct(PageVisit.visitor_token))
+            ).scalar_subquery()
+            today_visits_sq = (
+                select(func.count(PageVisit.id))
+                .where(PageVisit.visited_at >= today_start_utc, PageVisit.visited_at < today_end_utc)
+                .scalar_subquery()
             )
-        ).one()
+            today_unique_sq = (
+                select(func.count(func.distinct(PageVisit.visitor_token)))
+                .where(PageVisit.visited_at >= today_start_utc, PageVisit.visited_at < today_end_utc)
+                .scalar_subquery()
+            )
+            total_regs_sq = select(func.coalesce(func.sum(Guest.ticket_count), 0)).scalar_subquery()
+            today_regs_sq = (
+                select(func.coalesce(func.sum(Guest.ticket_count), 0))
+                .where(Guest.created_at >= today_start_utc, Guest.created_at < today_end_utc)
+                .scalar_subquery()
+            )
 
+            row = session.execute(
+                select(
+                    total_visits_sq.label("total_visits"),
+                    unique_visitors_sq.label("unique_visitors"),
+                    today_visits_sq.label("today_visits"),
+                    today_unique_sq.label("today_unique"),
+                    total_regs_sq.label("total_regs"),
+                    today_regs_sq.label("today_regs"),
+                )
+            ).one()
+
+            return {
+                "total_visits": int(row.total_visits or 0),
+                "unique_visitors": int(row.unique_visitors or 0),
+                "today_visits": int(row.today_visits or 0),
+                "today_unique": int(row.today_unique or 0),
+                "total_regs": int(row.total_regs or 0),
+                "today_regs": int(row.today_regs or 0),
+            }
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.get_site_stats unavailable, returning zeros: {e}")
         return {
-            "total_visits": int(row.total_visits or 0),
-            "unique_visitors": int(row.unique_visitors or 0),
-            "today_visits": int(row.today_visits or 0),
-            "today_unique": int(row.today_unique or 0),
-            "total_regs": int(row.total_regs or 0),
-            "today_regs": int(row.today_regs or 0),
+            "total_visits": 0,
+            "unique_visitors": 0,
+            "today_visits": 0,
+            "today_unique": 0,
+            "total_regs": 0,
+            "today_regs": 0,
         }
-    finally:
-        session.close()
 
 
 def record_submission(
@@ -1285,8 +1466,9 @@ def record_submission(
     validate_registration()'s cleaned["seat_numbers_str"]) so a failed
     seats_taken attempt still records which seats the guest was trying for.
     """
-    session = get_db()
+    session = None
     try:
+        session = get_db()
         log = SubmissionLog(
             name=name[:100],
             email=email[:120].lower().strip(),
@@ -1302,10 +1484,16 @@ def record_submission(
         session.add(log)
         session.commit()
     except Exception as e:
-        session.rollback()
+        # Also catches get_db() itself failing (session is None then, so the
+        # rollback is skipped). This is fire-and-forget audit logging — it
+        # must never be able to take down a registration, so the failure is
+        # only printed, never raised or returned.
+        if session is not None:
+            session.rollback()
         print(f"SubmissionLog insert failed: {e}")
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
 
 def _reporting_view_sql() -> dict:
@@ -2965,8 +3153,9 @@ def register_guest(
     else:
         requested = int(ticket_count) if ticket_count else 1
 
-    session = get_db()
+    session = None
     try:
+        session = get_db()
         existing = session.query(Guest).filter_by(email=email).first()
         if existing:
             return {
@@ -3023,17 +3212,23 @@ def register_guest(
     except IntegrityError:
         # Two concurrent submits with the same email both passed the
         # check above (TOCTOU) — the DB-level unique index closes the race.
-        session.rollback()
+        if session is not None:
+            session.rollback()
         return {
             "ok": False,
             "reason": "duplicate_email",
             "message": "This email is already registered. Check your email or use the 'My QR' page.",
         }
     except Exception as e:
-        session.rollback()
+        # Also catches get_db() itself failing (DB unreachable before a
+        # session could even be created) — session is None in that case,
+        # so the rollback above is skipped rather than raising NameError.
+        if session is not None:
+            session.rollback()
         return {"ok": False, "reason": "db_error", "message": f"Registration failed: {e}"}
     finally:
-        session.close()
+        if session is not None:
+            session.close()
 
 
 GUEST_NOT_FOUND_MESSAGE = (
@@ -3098,18 +3293,29 @@ def find_guest_by_code(code: str) -> dict:
 
     Returns {"status": "found"|"not_found"|"db_unavailable", "guest": dict|
     None, "message": str}.
+
+    db_degraded() only catches the "fell back to SQLite at boot" case. The
+    other failure mode — the engine connected fine and Postgres disappeared
+    later, so this specific query now raises — is caught here too, so a
+    scan attempt mid-outage reports "db_unavailable" (never a crash, and
+    never a false "not_found" that would send a real guest away thinking
+    they're not registered).
     """
     if db_degraded():
         return {"status": "db_unavailable", "guest": None, "message": DB_DEGRADED_MESSAGE}
 
-    session = get_db()
     try:
-        guest = _resolve_guest(session, code)
-        if not guest:
-            return {"status": "not_found", "guest": None, "message": GUEST_NOT_FOUND_MESSAGE}
-        return {"status": "found", "guest": guest.to_dict(), "message": ""}
-    finally:
-        session.close()
+        session = get_db()
+        try:
+            guest = _resolve_guest(session, code)
+            if not guest:
+                return {"status": "not_found", "guest": None, "message": GUEST_NOT_FOUND_MESSAGE}
+            return {"status": "found", "guest": guest.to_dict(), "message": ""}
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.find_guest_by_code unavailable: {e}")
+        return {"status": "db_unavailable", "guest": None, "message": DB_DEGRADED_MESSAGE}
 
 
 def wristband_count(guest: dict) -> int:
@@ -3165,7 +3371,21 @@ def check_in_by_code(code: str, bypass_window: bool = False) -> dict:
         if not status["open"]:
             return {"status": "not_open", "guest": None, "message": status["message"]}
 
-    session = get_db()
+    # get_db() itself failing (DB completely unreachable) is handled here,
+    # separately from the try/finally below: this function is a WRITE path
+    # that intentionally lets a mid-transaction failure raise rather than
+    # swallow it (see _process_checkin_confirmed() in streamlit_app.py,
+    # which is the layer that catches that and shows a calm error instead
+    # of a crash). But get_db() raising happens before any write is even
+    # attempted, so there's nothing gained by letting that specific failure
+    # escape uncaught — report it the same way the db_degraded() guard
+    # above does, so the UI has one "db_unavailable" case to handle.
+    try:
+        session = get_db()
+    except Exception as e:
+        print(f"check_in_by_code: get_db() failed: {e}")
+        return {"status": "db_unavailable", "guest": None, "message": DB_DEGRADED_MESSAGE}
+
     try:
         guest = _resolve_guest(session, code)
 
@@ -3221,7 +3441,16 @@ def check_in_guest(guest_id: int, bypass_window: bool = False) -> dict:
         if not status["open"]:
             return {"status": "not_open", "guest": None, "message": status["message"]}
 
-    session = get_db()
+    # See check_in_by_code()'s comment just above its equivalent guard: a
+    # get_db() failure is reported the same way db_degraded() above already
+    # is, while a mid-transaction failure below still raises on purpose —
+    # streamlit_app.py's _process_checkin_confirmed() catches that.
+    try:
+        session = get_db()
+    except Exception as e:
+        print(f"check_in_guest: get_db() failed: {e}")
+        return {"status": "db_unavailable", "guest": None, "message": DB_DEGRADED_MESSAGE}
+
     try:
         guest = session.query(Guest).filter_by(id=guest_id).first()
         if not guest:
@@ -3257,7 +3486,17 @@ def mark_band_given(guest_id: int) -> dict:
     "already given" (the old streamlit_app._mark_band_given silently did
     nothing — and showed no message — in both of those cases).
     """
-    session = get_db()
+    # mark_band_given() is a write path and intentionally doesn't swallow a
+    # mid-transaction failure (streamlit_app.py's _mark_band_given() wrapper
+    # catches that at the UI layer). A get_db() failure, though, happens
+    # before any write is attempted, so it's reported the same way the
+    # other "not found"/"already given" failures are rather than raising.
+    try:
+        session = get_db()
+    except Exception as e:
+        print(f"mark_band_given: get_db() failed: {e}")
+        return {"ok": False, "message": DB_DEGRADED_MESSAGE}
+
     try:
         guest = session.query(Guest).filter_by(id=guest_id).first()
         if not guest:
@@ -3275,8 +3514,16 @@ def mark_band_given(guest_id: int) -> dict:
 
 
 def delete_guest(guest_id: int) -> bool:
-    """Delete a guest by id. Returns True if a guest was deleted, False if not found."""
-    session = get_db()
+    """Delete a guest by id. Returns True if a guest was deleted, False if not found
+    (including if the database can't be reached at all — see mark_band_given()'s
+    comment on why only the get_db() failure is caught here, not a
+    mid-transaction one)."""
+    try:
+        session = get_db()
+    except Exception as e:
+        print(f"delete_guest: get_db() failed: {e}")
+        return False
+
     try:
         guest = session.query(Guest).filter_by(id=guest_id).first()
         if not guest:
@@ -3294,25 +3541,43 @@ def get_guest(guest_id: int) -> dict:
     Use this instead of scanning list_guests() — the My QR page and the
     registration success screen only ever need one row, and they re-run on
     every Streamlit interaction.
+
+    Must never raise: on a DB failure this returns None, same as "not
+    found" — the registration-confirmation card on Home already treats a
+    None guest as "the row is gone, drop the banner" (see
+    _render_registration_confirmation() in streamlit_app.py), which reads
+    fine either way during a brief outage.
     """
-    session = get_db()
     try:
-        guest = session.query(Guest).filter_by(id=guest_id).first()
-        return guest.to_dict() if guest else None
-    except Exception:
+        session = get_db()
+        try:
+            guest = session.query(Guest).filter_by(id=guest_id).first()
+            return guest.to_dict() if guest else None
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.get_guest({guest_id!r}) unavailable: {e}")
         return None
-    finally:
-        session.close()
 
 
 def get_guest_by_email(email: str) -> dict:
-    """Return a single guest by email as a plain dict, or None if not found."""
-    session = get_db()
+    """Return a single guest by email as a plain dict, or None if not found.
+
+    Must never raise — see get_guest()'s docstring. Callers that must not
+    confuse "DB unreachable" with "genuinely not registered" (e.g.
+    find_guest_by_contact()) check db_health() themselves before calling
+    this rather than relying on this return value to distinguish the two.
+    """
     try:
-        guest = session.query(Guest).filter_by(email=(email or "").strip().lower()).first()
-        return guest.to_dict() if guest else None
-    finally:
-        session.close()
+        session = get_db()
+        try:
+            guest = session.query(Guest).filter_by(email=(email or "").strip().lower()).first()
+            return guest.to_dict() if guest else None
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.get_guest_by_email unavailable: {e}")
+        return None
 
 
 def get_guest_by_phone(phone: str) -> dict:
@@ -3326,22 +3591,28 @@ def get_guest_by_phone(phone: str) -> dict:
 
     Phone is not unique (a couple may register separately from one number), so
     the most recent registration wins.
+
+    Must never raise — see get_guest()'s docstring.
     """
     phone_clean = sanitize_phone(phone or "")
     if not phone_clean:
         return None
 
-    session = get_db()
     try:
-        guest = (
-            session.query(Guest)
-            .filter_by(phone=phone_clean)
-            .order_by(Guest.id.desc())
-            .first()
-        )
-        return guest.to_dict() if guest else None
-    finally:
-        session.close()
+        session = get_db()
+        try:
+            guest = (
+                session.query(Guest)
+                .filter_by(phone=phone_clean)
+                .order_by(Guest.id.desc())
+                .first()
+            )
+            return guest.to_dict() if guest else None
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.get_guest_by_phone unavailable: {e}")
+        return None
 
 
 def find_guest_by_contact(query: str) -> tuple:
@@ -3351,10 +3622,25 @@ def find_guest_by_contact(query: str) -> tuple:
     user-facing message when the query is unusable or matched nothing. The
     field searched is decided by the shape of the input — an "@" means email,
     anything else is treated as a phone number.
+
+    Checks db_health() up front, before ever calling get_guest_by_email()/
+    get_guest_by_phone() — both of those return None on either "not found"
+    OR "the database is unreachable" (see their docstrings), and this is
+    the one caller that cannot afford to conflate the two: telling a real
+    guest "No guest found ... please register first" during an outage would
+    send someone who already paid back through the whole registration flow
+    (and risk a duplicate booking) for a problem that isn't theirs.
     """
     q = (query or "").strip()
     if not q:
         return None, "Please enter your email address or phone number."
+
+    health = db_health()
+    if not health["ok"]:
+        return None, (
+            "We can't check the guest list right now — the database is temporarily "
+            "unreachable. Please try again in a few minutes."
+        )
 
     if "@" in q:
         email_clean = sanitize_email(q)
@@ -3373,29 +3659,46 @@ def find_guest_by_contact(query: str) -> tuple:
 
 
 def list_guests() -> list:
-    """Return all guests, newest first, as plain dicts for the admin table."""
-    session = get_db()
+    """Return all guests, newest first, as plain dicts for the admin table.
+
+    Must never raise: on a DB failure returns [] (the same shape as a fresh
+    install with no guests). streamlit_app.py's Admin page checks
+    db_health() itself and skips rendering the Guests tab during an outage
+    rather than showing an empty grid as if there were truly no guests.
+    """
     try:
-        guests = session.query(Guest).order_by(Guest.created_at.desc()).all()
-        return [g.to_dict() for g in guests]
-    finally:
-        session.close()
+        session = get_db()
+        try:
+            guests = session.query(Guest).order_by(Guest.created_at.desc()).all()
+            return [g.to_dict() for g in guests]
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.list_guests unavailable, returning an empty list: {e}")
+        return []
 
 
 def get_recent_checkins(limit: int = 10) -> list:
-    """Return the most recent check-ins (newest first) as plain dicts."""
-    session = get_db()
+    """Return the most recent check-ins (newest first) as plain dicts.
+
+    Must never raise — see list_guests()'s docstring for the same contract.
+    """
     try:
-        recent = (
-            session.query(Guest)
-            .filter_by(checked_in=True)
-            .order_by(Guest.checkin_time.desc())
-            .limit(limit)
-            .all()
-        )
-        return [g.to_dict() for g in recent]
-    finally:
-        session.close()
+        session = get_db()
+        try:
+            recent = (
+                session.query(Guest)
+                .filter_by(checked_in=True)
+                .order_by(Guest.checkin_time.desc())
+                .limit(limit)
+                .all()
+            )
+            return [g.to_dict() for g in recent]
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.get_recent_checkins unavailable, returning an empty list: {e}")
+        return []
 
 
 def get_registration_daily_counts() -> list:
@@ -3405,19 +3708,28 @@ def get_registration_daily_counts() -> list:
     created_at is stored naive UTC (see _utc_now()); bucketing by the raw
     UTC date attributes an evening registration (after ~7 PM local) to the
     following day. Used to drive the admin "registrations by day" bar chart.
+
+    Must never raise: on a DB failure returns [], which the Home/Admin bar
+    chart already renders as "No registrations yet" — display-only, and
+    paired with the top-of-page outage banner so it doesn't read as a real
+    claim that nobody has registered.
     """
-    session = get_db()
     try:
-        guests = session.query(Guest).order_by(Guest.created_at).all()
-        counts: dict = {}
-        for g in guests:
-            if not g.created_at:
-                continue
-            day = to_event_local(g.created_at).date()
-            counts[day] = counts.get(day, 0) + (g.ticket_count or 0)
-        return sorted(counts.items())
-    finally:
-        session.close()
+        session = get_db()
+        try:
+            guests = session.query(Guest).order_by(Guest.created_at).all()
+            counts: dict = {}
+            for g in guests:
+                if not g.created_at:
+                    continue
+                day = to_event_local(g.created_at).date()
+                counts[day] = counts.get(day, 0) + (g.ticket_count or 0)
+            return sorted(counts.items())
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.get_registration_daily_counts unavailable, returning an empty list: {e}")
+        return []
 
 
 def apply_guest_changes(updates: list) -> dict:
@@ -3491,26 +3803,34 @@ def get_event_day_hourly_checkins() -> list:
     into the next UTC day) falls outside the filter window and vanishes
     from the chart entirely. Used to drive the admin "check-ins on event
     day" bar chart.
+
+    Must never raise: on a DB failure returns [0] * 24 — still a
+    24-element list (the documented shape), just all zero — rather than
+    propagating.
     """
-    session = get_db()
     try:
-        event_start_utc, event_end_utc = _local_day_utc_bounds(config.EVENT_DATE.date())
-        event_checkins = (
-            session.query(Guest)
-            .filter(
-                Guest.checked_in == True,
-                Guest.checkin_time >= event_start_utc,
-                Guest.checkin_time < event_end_utc,
+        session = get_db()
+        try:
+            event_start_utc, event_end_utc = _local_day_utc_bounds(config.EVENT_DATE.date())
+            event_checkins = (
+                session.query(Guest)
+                .filter(
+                    Guest.checked_in == True,
+                    Guest.checkin_time >= event_start_utc,
+                    Guest.checkin_time < event_end_utc,
+                )
+                .all()
             )
-            .all()
-        )
-        hourly = [0] * 24
-        for g in event_checkins:
-            if g.checkin_time:
-                hourly[to_event_local(g.checkin_time).hour] += 1
-        return hourly
-    finally:
-        session.close()
+            hourly = [0] * 24
+            for g in event_checkins:
+                if g.checkin_time:
+                    hourly[to_event_local(g.checkin_time).hour] += 1
+            return hourly
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.get_event_day_hourly_checkins unavailable, returning zeros: {e}")
+        return [0] * 24
 
 
 # ── Full Backup Export (Admin "Danger Zone") ─────────────────────────────────
@@ -3645,7 +3965,7 @@ def export_backup() -> dict:
     taken just before a reset must not silently drop the rows that were still
     sitting in memory.
 
-    Returns:
+    Returns on success:
         {
           "generated_at": datetime (naive UTC),
           "stamp": "20260810_143000"        # for filenames
@@ -3653,34 +3973,48 @@ def export_backup() -> dict:
           "files": {"guests.csv": "<csv text>", ..., "README.txt": "..."},
           "zip": bytes                       # every file above, deflated
         }
+
+    Never raises. This is called from the Admin "Danger Zone" with no
+    try/except around it (the page already checked db_health() once per
+    render, but the database can still disappear in the narrow window
+    between that check and the "Prepare backup" click) — so on any DB
+    failure it returns {"ok": False, "message": ...} instead: a shape with
+    none of the keys above, so it can never be mistaken for a real,
+    zero-row backup.
     """
     flush_page_visits()
     generated_at = _utc_now()
-    session = get_db()
+    session = None
     try:
-        files = {}
-        counts = {}
-        for table, model, columns, order_by, _description in _BACKUP_SPECS:
-            rows = session.query(model).order_by(getattr(model, order_by)).all()
-            counts[table] = len(rows)
-            files[f"{table}.csv"] = _rows_to_csv(columns, rows)
-    finally:
-        session.close()
+        try:
+            session = get_db()
+            files = {}
+            counts = {}
+            for table, model, columns, order_by, _description in _BACKUP_SPECS:
+                rows = session.query(model).order_by(getattr(model, order_by)).all()
+                counts[table] = len(rows)
+                files[f"{table}.csv"] = _rows_to_csv(columns, rows)
+        finally:
+            if session is not None:
+                session.close()
 
-    files["README.txt"] = _backup_readme(generated_at, counts)
+        files["README.txt"] = _backup_readme(generated_at, counts)
 
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for filename, content in files.items():
-            archive.writestr(filename, content)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for filename, content in files.items():
+                archive.writestr(filename, content)
 
-    return {
-        "generated_at": generated_at,
-        "stamp": generated_at.strftime("%Y%m%d_%H%M%S"),
-        "counts": counts,
-        "files": files,
-        "zip": buffer.getvalue(),
-    }
+        return {
+            "generated_at": generated_at,
+            "stamp": generated_at.strftime("%Y%m%d_%H%M%S"),
+            "counts": counts,
+            "files": files,
+            "zip": buffer.getvalue(),
+        }
+    except Exception as e:
+        print(f"export_backup failed: {e}")
+        return {"ok": False, "message": DB_DEGRADED_MESSAGE}
 
 
 # ── Data Reset (Admin "Danger Zone") ─────────────────────────────────────────
@@ -3692,18 +4026,28 @@ def get_table_counts() -> dict:
     reset is about to destroy before they confirm it. Flushes the buffered
     page-visit rows first (see record_visit()) so the page_visits count
     isn't missing whatever hasn't hit the DB yet.
+
+    Must never raise: on a DB failure returns every count as 0. The Admin
+    page checks db_health() itself and skips the Danger Zone entirely
+    during an outage (an all-zero read here must never be allowed to imply
+    "nothing to reset" and enable a destructive action against a database
+    we can't actually see).
     """
-    flush_page_visits()
-    session = get_db()
     try:
-        return {
-            "guests": session.query(Guest).count(),
-            "checkin_logs": session.query(CheckInLog).count(),
-            "page_visits": session.query(PageVisit).count(),
-            "submission_logs": session.query(SubmissionLog).count(),
-        }
-    finally:
-        session.close()
+        flush_page_visits()
+        session = get_db()
+        try:
+            return {
+                "guests": session.query(Guest).count(),
+                "checkin_logs": session.query(CheckInLog).count(),
+                "page_visits": session.query(PageVisit).count(),
+                "submission_logs": session.query(SubmissionLog).count(),
+            }
+        finally:
+            session.close()
+    except Exception as e:
+        print(f"utils.get_table_counts unavailable, returning zeros: {e}")
+        return {"guests": 0, "checkin_logs": 0, "page_visits": 0, "submission_logs": 0}
 
 
 def reset_all_data(keep_settings: bool = True) -> dict:
@@ -3725,18 +4069,26 @@ def reset_all_data(keep_settings: bool = True) -> dict:
     left, get_checkin_mode() falls back to its own "auto" default, so the
     effective behavior is the same either way.
 
-    Returns the per-table counts actually deleted, e.g.
+    Returns the per-table counts actually deleted on success, e.g.
     {"guests": 12, "checkin_logs": 9, "page_visits": 40, "submission_logs": 15}.
-    Raises on failure (after rolling back) — callers must not report success
-    without catching it.
+
+    Never raises. The Admin "Danger Zone" calls this with no try/except
+    around it (the page already checked db_health() once per render, but
+    the database can still disappear in the narrow window between that
+    check and the confirmed delete click), so a failure here — including
+    get_db() itself being unable to reach the database — is rolled back and
+    reported as {"ok": False, "message": ...} instead of raising. That
+    shape carries none of the count keys above, so it can never be
+    mistaken for a real, zero-row reset.
     """
     # Flush any buffered page visits (see record_visit()) to the DB BEFORE
     # deleting, so they're included in the deleted count and, just as
     # importantly, so a stray background flush can't write them back into
     # page_visits moments after this "empties everything" reset ran.
     flush_page_visits()
-    session = get_db()
+    session = None
     try:
+        session = get_db()
         # Children before parents: checkin_logs.guest_id references guests.id.
         # Query.delete() returns the number of rows actually removed, so the
         # reported counts reflect this transaction's DELETEs exactly rather
@@ -3769,8 +4121,14 @@ def reset_all_data(keep_settings: bool = True) -> dict:
             "page_visits": page_visits_deleted,
             "submission_logs": submission_logs_deleted,
         }
-    except Exception:
-        session.rollback()
-        raise
+    except Exception as e:
+        # Also catches get_db() itself failing, in which case session is
+        # still None here and the rollback below is skipped rather than
+        # raising NameError on top of the original failure.
+        if session is not None:
+            session.rollback()
+        print(f"reset_all_data failed, rolled back: {e}")
+        return {"ok": False, "message": DB_DEGRADED_MESSAGE}
     finally:
-        session.close()
+        if session is not None:
+            session.close()

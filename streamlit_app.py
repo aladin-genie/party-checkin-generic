@@ -40,15 +40,31 @@ if startup_error:
     st.code(startup_error)
     st.stop()
 
+# CSS first, before anything that might need to render styled HTML below —
+# including the outage banner just past the DB-init guard, which would
+# otherwise paint as an unstyled raw <div> if it had to fire before any
+# stylesheet existed. Cheap and has no DB dependency, so there's no reason
+# it should wait behind ensure_db_ready().
+theme.inject_css()
+
 # ── Initialize DB ─────────────────────────────────────────────────────────────
+# init_db() (via ensure_db_ready(), cached so this only really runs once per
+# process) can raise if the configured database is unreachable at boot —
+# this used to st.error() + st.code(a raw traceback) + st.stop(), which is
+# exactly the kind of crash-page this whole file now exists to avoid. A
+# guest opening the link mid-outage doesn't need a stack trace; they need
+# the same calm banner every other page shows. The full traceback still
+# goes to the server log (print, not st.code) so the organiser can debug it
+# from Manage app → Logs. Nothing DB-backed can render this run, so this
+# stops the script here rather than falling through to a page that would
+# immediately try to read guests anyway.
 try:
     utils.ensure_db_ready()
 except Exception:
-    st.error("🚨 The app failed to start. Please share this error with the developer:")
-    st.code(traceback.format_exc())
+    print(f"utils.ensure_db_ready() failed at boot:\n{traceback.format_exc()}")
+    st.markdown(theme.brand_bar(), unsafe_allow_html=True)
+    st.markdown(theme.db_unavailable_banner(), unsafe_allow_html=True)
     st.stop()
-
-theme.inject_css()
 
 PAGES = ["Home", "Register", "My QR", "Scanner", "Admin"]
 
@@ -98,14 +114,40 @@ ZELLE_INFO = config.zelle_info()
 # clear only the specific cache(s) their write affects (see PART 7) rather
 # than st.cache_data.clear(), which would wipe every cached value for every
 # user in the whole app.
+#
+# The four wrappers below also each carry their own try/except returning a
+# neutral value. utils.get_stats()/get_site_stats()/
+# get_registration_daily_counts()/get_event_day_hourly_checkins() already
+# degrade to their documented empty shape internally on a DB failure (never
+# raise) — this is deliberate belt-and-suspenders on top of that, since
+# these are @st.cache_data functions Streamlit itself wraps: a page must
+# never crash here regardless of which layer an unexpected failure surfaces
+# at. Display-only; whether a page is ALLOWED to show these numbers as real
+# is decided by utils.db_health() at the page level (see main()), not here.
 @st.cache_data(ttl=10, show_spinner=False)
 def _cached_stats():
-    return utils.get_stats()
+    try:
+        return utils.get_stats()
+    except Exception as e:
+        print(f"_cached_stats failed, returning zeros: {e}")
+        return {
+            "total_guests": 0, "checked_in": 0, "bands_distributed": 0, "pending": 0,
+            "total_tickets": 0, "admitted_tickets": 0, "plus_one_count": 0,
+            "named_guests": 0, "unnamed_tickets": 0, "avg_tickets_per_guest": 0.0,
+            "checkin_percentage": 0.0, "revenue": 0.0,
+        }
 
 
 @st.cache_data(ttl=10, show_spinner=False)
 def _cached_site_stats():
-    return utils.get_site_stats()
+    try:
+        return utils.get_site_stats()
+    except Exception as e:
+        print(f"_cached_site_stats failed, returning zeros: {e}")
+        return {
+            "total_visits": 0, "unique_visitors": 0, "today_visits": 0,
+            "today_unique": 0, "total_regs": 0, "today_regs": 0,
+        }
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -134,12 +176,20 @@ def _cached_seat_availability():
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_registration_daily_counts():
-    return utils.get_registration_daily_counts()
+    try:
+        return utils.get_registration_daily_counts()
+    except Exception as e:
+        print(f"_cached_registration_daily_counts failed, returning an empty list: {e}")
+        return []
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_event_day_hourly_checkins():
-    return utils.get_event_day_hourly_checkins()
+    try:
+        return utils.get_event_day_hourly_checkins()
+    except Exception as e:
+        print(f"_cached_event_day_hourly_checkins failed, returning zeros: {e}")
+        return [0] * 24
 
 
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=500)
@@ -293,80 +343,97 @@ def page_home():
     # Public, aggregate-only site activity — no guest names/emails/phones/
     # Zelle refs ever appear here. Moved from the admin dashboard: the owner
     # doesn't consider it sensitive and would rather show it off than bury it.
-    site_stats = _cached_site_stats()
     st.markdown(
         theme.section_header(
             "🔔 Community Buzz", "A live pulse of interest in the evening so far — nothing guest-specific."
         ),
         unsafe_allow_html=True,
     )
-    if site_stats["total_visits"] == 0 and site_stats["total_regs"] == 0:
+
+    if not utils.db_health()["ok"]:
+        # Every number in this section is a live DB read. Showing them as
+        # zeros here (the shape they'd degrade to) would read exactly like
+        # "nobody's registered" — false, and the opposite of reassuring
+        # during an outage. The top-of-page banner (see main()) already
+        # explains what's going on; skip the section entirely rather than
+        # dress up "we don't know" as "The buzz starts here".
         st.markdown(
             theme.empty_state(
-                "🌱", "The buzz starts here",
-                "Nobody's visited yet — traffic and registration numbers will start moving "
-                "the moment the first guest opens this site.",
+                "🔌", "Stats temporarily unavailable",
+                "We can't reach the guest database right now, so live numbers are paused. "
+                "Check back in a few minutes.",
             ),
             unsafe_allow_html=True,
         )
     else:
-        # Just one number of pure site traffic (Registered Guests) used to
-        # sit awkwardly alone in a 4-up grid after the three raw-traffic
-        # tiles (Unique Visitors / Page Views / Visitors Today) were dropped
-        # as not guest-relevant. Paired here with seats remaining — the
-        # other number that actually matters to a guest deciding whether to
-        # register — both given "hero" emphasis so they read as a
-        # deliberate two-up row rather than one stranded tile plus empty
-        # space. Mirrors the admin dashboard's own hero-tile pairing
-        # (Checked In / Total Guests).
-        seat_avail = _cached_seat_availability()
-        # A DB blip must not paint "0 of N" here — that reads exactly like
-        # the event being full. Show a dash instead when we genuinely don't
-        # know (see utils.seat_availability()'s unavailable flag).
-        if seat_avail["unavailable"]:
-            seats_value, seats_caption = "—", "temporarily unavailable"
+        site_stats = _cached_site_stats()
+        if site_stats["total_visits"] == 0 and site_stats["total_regs"] == 0:
+            st.markdown(
+                theme.empty_state(
+                    "🌱", "The buzz starts here",
+                    "Nobody's visited yet — traffic and registration numbers will start moving "
+                    "the moment the first guest opens this site.",
+                ),
+                unsafe_allow_html=True,
+            )
         else:
-            seats_value = seat_avail["remaining"]
-            seats_caption = f"of {seat_avail['total']} total"
-        st.markdown(
-            theme.stat_tiles(
-                [
-                    {
-                        "label": "Registered Guests", "value": site_stats["total_regs"],
-                        "caption": f"+{site_stats['today_regs']} today", "icon": "📝",
-                        "accent": "gold", "emphasis": "hero",
-                    },
-                    {
-                        "label": "Seats Remaining", "value": seats_value,
-                        "caption": seats_caption, "icon": "💺",
-                        "accent": "turquoise", "emphasis": "hero",
-                    },
-                ]
-            ),
-            unsafe_allow_html=True,
-        )
+            # Just one number of pure site traffic (Registered Guests) used to
+            # sit awkwardly alone in a 4-up grid after the three raw-traffic
+            # tiles (Unique Visitors / Page Views / Visitors Today) were dropped
+            # as not guest-relevant. Paired here with seats remaining — the
+            # other number that actually matters to a guest deciding whether to
+            # register — both given "hero" emphasis so they read as a
+            # deliberate two-up row rather than one stranded tile plus empty
+            # space. Mirrors the admin dashboard's own hero-tile pairing
+            # (Checked In / Total Guests).
+            seat_avail = _cached_seat_availability()
+            # A DB blip must not paint "0 of N" here — that reads exactly like
+            # the event being full. Show a dash instead when we genuinely don't
+            # know (see utils.seat_availability()'s unavailable flag).
+            if seat_avail["unavailable"]:
+                seats_value, seats_caption = "—", "temporarily unavailable"
+            else:
+                seats_value = seat_avail["remaining"]
+                seats_caption = f"of {seat_avail['total']} total"
+            st.markdown(
+                theme.stat_tiles(
+                    [
+                        {
+                            "label": "Registered Guests", "value": site_stats["total_regs"],
+                            "caption": f"+{site_stats['today_regs']} today", "icon": "📝",
+                            "accent": "gold", "emphasis": "hero",
+                        },
+                        {
+                            "label": "Seats Remaining", "value": seats_value,
+                            "caption": seats_caption, "icon": "💺",
+                            "accent": "turquoise", "emphasis": "hero",
+                        },
+                    ]
+                ),
+                unsafe_allow_html=True,
+            )
 
-    daily_counts = _cached_registration_daily_counts()
-    if daily_counts:
-        reg_df = pd.DataFrame(
-            {"Registrations": [c for _, c in daily_counts]},
-            index=[d.strftime("%b %d") for d, _ in daily_counts],
-        )
-        st.caption("📈 Registrations by day — how quickly folks have been signing up.")
-        _render_bar_chart(reg_df)
-    else:
-        st.info("No registrations yet — be the first to sign up!")
+        daily_counts = _cached_registration_daily_counts()
+        if daily_counts:
+            reg_df = pd.DataFrame(
+                {"Registrations": [c for _, c in daily_counts]},
+                index=[d.strftime("%b %d") for d, _ in daily_counts],
+            )
+            st.caption("📈 Registrations by day — how quickly folks have been signing up.")
+            _render_bar_chart(reg_df)
+        else:
+            st.info("No registrations yet — be the first to sign up!")
 
-    hourly = _cached_event_day_hourly_checkins()
-    if any(hourly):
-        checkin_df = pd.DataFrame(
-            {"Check-ins": hourly},
-            index=[f"{h:02d}:00" for h in range(24)],
-        )
-        st.caption(f"🚪 Check-ins by hour on {config.EVENT_DATE_SHORT} — the flow through the door.")
-        _render_bar_chart(checkin_df)
-    else:
-        st.info(f"Check-ins will show up here live once doors open on {config.EVENT_DATE_SHORT}.")
+        hourly = _cached_event_day_hourly_checkins()
+        if any(hourly):
+            checkin_df = pd.DataFrame(
+                {"Check-ins": hourly},
+                index=[f"{h:02d}:00" for h in range(24)],
+            )
+            st.caption(f"🚪 Check-ins by hour on {config.EVENT_DATE_SHORT} — the flow through the door.")
+            _render_bar_chart(checkin_df)
+        else:
+            st.info(f"Check-ins will show up here live once doors open on {config.EVENT_DATE_SHORT}.")
 
     st.markdown(theme.section_header("Get Started"), unsafe_allow_html=True)
 
@@ -976,6 +1043,21 @@ def page_my_qr():
     with header_col2:
         _home_button(key="home_my_qr")
 
+    if not utils.db_health()["ok"]:
+        # Neither path below can succeed without the database: the guest_id
+        # shortcut would otherwise call utils.get_guest() (which degrades to
+        # None on failure) and show a flatly false "Guest not found.", and
+        # the lookup form would tell a real, already-paid guest "No guest
+        # found ... please register first" — see utils.find_guest_by_contact()'s
+        # docstring for why that's the one thing this page must never say
+        # during an outage. Skip both; the banner up top already explains why.
+        st.info(
+            "Ticket lookups are paused until the database connection is restored. "
+            "Please try again in a few minutes — your QR code was also emailed to you "
+            "when you registered, so check your inbox (and spam folder) in the meantime."
+        )
+        return
+
     # Try query params or session state
     guest_id = None
     try:
@@ -1091,6 +1173,20 @@ def page_scanner():
         st.caption("Scan your QR code at the entrance")
     with header_col2:
         _home_button(key="home_scanner")
+
+    if not utils.db_health()["ok"]:
+        # Skip everything below, not just the camera/manual-entry inputs:
+        # the stat tiles read from _cached_stats(), which degrades to zeros
+        # on failure — rendering "No guests yet" during an outage would be a
+        # flat lie on the exact page door staff are staring at. No lookup
+        # could succeed anyway (utils.checkin_status() would itself fail
+        # closed), so there's nothing safe left on this page to show besides
+        # the top-of-page banner (see main()).
+        st.info(
+            "Check-in is paused until the database connection is restored. "
+            "Please try again in a few minutes."
+        )
+        return
 
     stats = _cached_stats()
     if stats["total_guests"] == 0:
@@ -1275,9 +1371,24 @@ def _process_checkin_confirmed(guest_id: int):
     Keyed by id, not by the code that was searched: re-resolving a phone
     number at confirm time could land on a different booking than the one
     whose details staff just read back to the guest.
+
+    utils.check_in_guest() intentionally raises rather than swallowing a
+    write failure (see its docstring) — it's a write path, and the caller
+    must not be handed a false "success". page_scanner() already keeps
+    this button off-screen whenever utils.db_health() reports the database
+    down, but that check happens once per render; the database can still
+    die in the narrow window between that check and this click. Catching it
+    here turns that race into the same calm "couldn't reach the database"
+    result _apply_checkin_result() already renders for db_unavailable,
+    instead of an uncaught exception taking down the whole page.
     """
     st.session_state["scanner_lookup"] = None
-    _apply_checkin_result(utils.check_in_guest(guest_id))
+    try:
+        result = utils.check_in_guest(guest_id)
+    except Exception as e:
+        print(f"check_in_guest({guest_id!r}) failed: {e}")
+        result = {"status": "db_unavailable", "guest": None, "message": utils.DB_DEGRADED_MESSAGE}
+    _apply_checkin_result(result)
 
 
 def _apply_checkin_result(result: dict):
@@ -1393,8 +1504,22 @@ def _mark_band_given(guest_id: int):
     Stashes the result via _set_flash() instead of calling st.success()
     directly — a st.rerun() follows immediately below, which used to discard
     the message before staff ever saw it (see PART 6).
+
+    utils.mark_band_given() is a write path and doesn't swallow a DB
+    failure (see _process_checkin_confirmed()'s docstring for why that's
+    correct and why this try/except exists anyway: the database can die in
+    the narrow window between page_scanner()'s once-per-render health check
+    and this click).
     """
-    result = utils.mark_band_given(guest_id)
+    try:
+        result = utils.mark_band_given(guest_id)
+    except Exception as e:
+        print(f"mark_band_given({guest_id!r}) failed: {e}")
+        st.error(
+            "Couldn't mark the wristband as given — the database is temporarily "
+            "unreachable. Please try again in a moment."
+        )
+        return
     _cached_stats.clear()
     if result["ok"]:
         _set_flash("success", result["message"])
@@ -1471,6 +1596,20 @@ def page_admin():
     if st.button("🔒 Logout", type="secondary"):
         st.session_state["admin_authenticated"] = False
         st.rerun()
+
+    if not utils.db_health()["ok"]:
+        # Password check above only reads a secret (verify_admin_password),
+        # so login itself must keep working during an outage — an admin
+        # locked out of their own dashboard is the last thing this needs.
+        # But every tab below (guest table, check-in log, stats) and the
+        # Danger Zone (which reads live table counts before allowing a
+        # delete) are all DB-backed; skip the whole dashboard body rather
+        # than let any of them explode or show stale/zeroed numbers as real.
+        st.info(
+            "Guest management is paused until the database connection is restored. "
+            "Try refreshing in a few minutes."
+        )
+        return
 
     tab_overview, tab_guests, tab_checkins = st.tabs(["Overview", "Guests", "Check-ins"])
 
@@ -1554,6 +1693,17 @@ def _admin_danger_zone():
                 st.error(f"Type “{RESET_CONFIRM_PHRASE}” exactly to confirm.")
             else:
                 result = utils.reset_all_data()
+                # reset_all_data() reports a DB failure as {"ok": False, ...}
+                # rather than raising, so the counts are absent on that path.
+                # Never claim a reset happened when it didn't — the operator
+                # would think the tables were cleared and stop checking.
+                if result.get("ok") is False:
+                    _set_flash(
+                        "error",
+                        "⚠️ Reset failed — the guest database is unreachable, so nothing was "
+                        f"deleted. {result.get('message', '')} Please try again once it's back.",
+                    )
+                    st.rerun()
                 _clear_all_caches_and_state_after_reset()
                 summary = (
                     f"✅ Reset complete — deleted {result['guests']} guest(s), "
@@ -1586,7 +1736,19 @@ def _admin_backup_section():
 
     if st.button("📦 Prepare backup", use_container_width=True, key="admin_backup_prepare"):
         with st.spinner("Reading every table…"):
-            st.session_state["admin_backup"] = utils.export_backup()
+            result = utils.export_backup()
+        # export_backup() reports a DB failure as {"ok": False, ...} rather
+        # than raising, so a failed snapshot has no "zip"/"stamp" keys. Keep
+        # it OUT of session_state: storing it would make the download buttons
+        # below hand the operator an archive that doesn't exist, and — worse —
+        # make the Danger Zone look like a backup had been taken before a wipe.
+        if result.get("ok") is False:
+            st.error(
+                "⚠️ Couldn't build the backup — the guest database is unreachable. "
+                f"{result.get('message', '')} Do NOT reset until a backup succeeds."
+            )
+        else:
+            st.session_state["admin_backup"] = result
 
     backup = st.session_state.get("admin_backup")
     if backup is None:
@@ -1903,11 +2065,12 @@ def _admin_guests_tab():
             # batch) until the admin confirms below (see PART 5).
             st.session_state["admin_pending_changes"] = pending
         else:
-            result = utils.apply_guest_changes(pending)
-            st.session_state.pop("admin_guest_editor", None)
-            _apply_guest_changes_cache_clear(result)
-            _report_guest_changes(result)
-            st.rerun()
+            result = _call_apply_guest_changes(pending)
+            if result is not None:
+                st.session_state.pop("admin_guest_editor", None)
+                _apply_guest_changes_cache_clear(result)
+                _report_guest_changes(result)
+                st.rerun()
 
     pending_changes = st.session_state.get("admin_pending_changes")
     if pending_changes:
@@ -1926,16 +2089,38 @@ def _admin_guests_tab():
                 use_container_width=True,
                 key="admin_confirm_apply",
             ):
-                result = utils.apply_guest_changes(st.session_state["admin_pending_changes"])
-                st.session_state["admin_pending_changes"] = None
-                st.session_state.pop("admin_guest_editor", None)
-                _apply_guest_changes_cache_clear(result)
-                _report_guest_changes(result)
-                st.rerun()
+                result = _call_apply_guest_changes(st.session_state["admin_pending_changes"])
+                if result is not None:
+                    st.session_state["admin_pending_changes"] = None
+                    st.session_state.pop("admin_guest_editor", None)
+                    _apply_guest_changes_cache_clear(result)
+                    _report_guest_changes(result)
+                    st.rerun()
         with cc2:
             if st.button("Cancel", use_container_width=True, key="admin_cancel_apply"):
                 st.session_state["admin_pending_changes"] = None
                 st.rerun()
+
+
+def _call_apply_guest_changes(updates: list):
+    """utils.apply_guest_changes() wrapped for the same narrow-race reason as
+    _process_checkin_confirmed()/_mark_band_given(): it's a write path (it
+    checks guests in, hands out bands, deletes rows) and correctly doesn't
+    swallow a DB failure — but the database can still die in the window
+    between page_admin()'s once-per-render health check and this button
+    click, and a raised exception here must not take down the whole Admin
+    page. Returns None (having already shown an error) on failure, so
+    callers can skip the cache-clear/report/rerun that assumes success.
+    """
+    try:
+        return utils.apply_guest_changes(updates)
+    except Exception as e:
+        print(f"apply_guest_changes failed: {e}")
+        st.error(
+            "Couldn't save those changes — the database is temporarily unreachable. "
+            "Please try again in a moment."
+        )
+        return None
 
 
 def _apply_guest_changes_cache_clear(result: dict) -> None:
@@ -2127,6 +2312,19 @@ def main():
 
     # Sticky brand bar on every page
     st.markdown(theme.brand_bar(), unsafe_allow_html=True)
+
+    # ── Database health ─────────────────────────────────────────────────────
+    # A cheap, ACTIVELY re-probed check (unlike the cached engine itself,
+    # which only validates its connection once, at creation — see
+    # utils.db_health()'s docstring). The page is already resolved above, so
+    # this renders once, right here, ahead of every page's own content — the
+    # one signal a guest or organiser sees regardless of which page they're
+    # on. Individual page functions below call utils.db_health() again
+    # (cheap: memoized for a few seconds) to decide what DB-backed content to
+    # skip; they don't re-render this banner themselves.
+    db_health = utils.db_health()
+    if not db_health["ok"]:
+        st.markdown(theme.db_unavailable_banner(db_health.get("error", "")), unsafe_allow_html=True)
 
     if is_busy:
         st.markdown(theme.busy_banner(), unsafe_allow_html=True)

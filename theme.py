@@ -1656,6 +1656,32 @@ a.sponsor-card:hover {
 }
 .closed-notice-message { color: var(--text-dim); font-size: 0.95rem; }
 
+/* ── DB outage banner (top of every page during a database outage) ────── */
+/* Warm/warn-toned rather than the alarming err-red: the situation is fully
+   explained and the app isn't broken, just paused — but still visually
+   distinct from the calmer, informational .closed-notice box above (which
+   this is often paired with, further down the same page), since it has to
+   register at a glance at the very top of the page. */
+.db-unavailable-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    background: var(--warn-bg);
+    border: 1px solid var(--warn-border);
+    border-radius: var(--radius-lg);
+    padding: var(--space-4) var(--space-5);
+    margin: 0 0 var(--space-4) 0;
+}
+.db-unavailable-icon { font-size: 1.7rem; line-height: 1.2; }
+.db-unavailable-title {
+    font-size: 1.05rem;
+    font-weight: 800;
+    color: var(--text);
+    margin-bottom: 4px;
+}
+.db-unavailable-message { color: var(--text-dim); font-size: 0.92rem; margin-bottom: 6px; }
+.db-unavailable-hint { color: var(--text-dimmer); font-size: 0.8rem; }
+
 /* ── Capacity guard: full-page notice + busy banner ───────────────────── */
 /* Shown instead of the whole app when active_session_count() is over the
    hard limit — warm and party-themed, never "server error"-flavored. See
@@ -2213,6 +2239,50 @@ def seats_unavailable_notice(message: str = "") -> str:
         <div class="closed-notice-icon">🔌</div>
         <div class="closed-notice-title">Seat availability is temporarily unavailable</div>
         <div class="closed-notice-message">{html.escape(message or SEATS_UNAVAILABLE_MESSAGE)}</div>
+    </div>
+    """
+
+
+DB_UNAVAILABLE_MESSAGE = (
+    "We can't reach the guest database right now, so registrations and check-ins are paused "
+    "for a moment to make sure nothing gets lost or double-booked. Nothing you've already done "
+    "has been affected. Please try again in a few minutes."
+)
+
+
+def db_unavailable_banner(detail: str = "") -> str:
+    """A prominent but calm banner rendered at the top of EVERY page while
+    utils.db_health() reports the database unreachable (see
+    streamlit_app.main()) — the single, always-on signal that a guest or
+    organiser sees regardless of which page they're on, so the outage never
+    just looks like a page that quietly stopped working.
+
+    Reuses the warn tokens (`--warn-bg`/`--warn-border`) rather than the
+    alarming err-red ones: the situation is fully explained right here and
+    the app itself isn't broken, just paused — the same calmer register as
+    closed_notice()/seats_unavailable_notice(), whose `.closed-notice`
+    structure (icon, title, message) this mirrors, just recolored and
+    widened to sit at the very top of the page rather than in place of one
+    form. Never claims anything false: it says "temporarily unreachable",
+    never "sold out" or "0 guests" — those numbers simply aren't shown
+    elsewhere on the page while this banner is up (see each page's own
+    degraded-state handling in streamlit_app.py).
+
+    `detail` is utils.db_health()["error"] — a short, already-scrubbed
+    diagnostic (never the DSN/password; db_health() is careful about that)
+    — surfaced only inside the small organiser-facing hint line at the
+    bottom, since the person best placed to actually fix a database outage
+    is the one most likely to be staring at this banner when it happens.
+    """
+    detail_html = f" Detail: {html.escape(detail)}" if detail else ""
+    return f"""
+    <div class="db-unavailable-banner">
+        <div class="db-unavailable-icon">🔌</div>
+        <div class="db-unavailable-body">
+            <div class="db-unavailable-title">Guest database temporarily unreachable</div>
+            <div class="db-unavailable-message">{html.escape(DB_UNAVAILABLE_MESSAGE)}</div>
+            <div class="db-unavailable-hint">Organiser: check the database connection — see Manage app → Logs.{detail_html}</div>
+        </div>
     </div>
     """
 
