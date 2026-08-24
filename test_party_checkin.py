@@ -12,6 +12,7 @@ import csv
 import re
 import threading
 import time
+from types import SimpleNamespace
 import zipfile
 
 # Add project root to path
@@ -4378,6 +4379,54 @@ class TestDbConnectionDiagnostics(unittest.TestCase):
         hint = utils.db_connection_diagnostics()["hint"]
         self.assertNotIn("IPv6", hint)
         self.assertIn("credentials", hint.lower())
+
+
+
+class TestFallbackSelfHealing(unittest.TestCase):
+    """get_engine() must recover from the SQLite fallback on its own.
+
+    _get_engine_cached is an @st.cache_resource, so without this the first
+    connection failure pins the app to SQLite for the life of the process:
+    the database coming back changes nothing and an operator has to hit
+    "Reboot app". On event night, with staff checking people in, that is the
+    wrong failure mode.
+    """
+
+    def setUp(self):
+        self._retry = utils.DB_FALLBACK_RETRY_SECONDS
+        self._state = dict(utils._fallback_retry_state)
+
+    def tearDown(self):
+        utils.DB_FALLBACK_RETRY_SECONDS = self._retry
+        utils._fallback_retry_state["last_attempt"] = self._state["last_attempt"]
+
+    def test_no_retry_while_inside_the_cooldown_window(self):
+        # A failed retry costs a full connect timeout, so an unbounded retry
+        # would stall EVERY page load against a dead host.
+        utils.DB_FALLBACK_RETRY_SECONDS = 3600
+        utils._fallback_retry_state["last_attempt"] = time.time()
+        calls = {"n": 0}
+        real_clear = utils._get_engine_cached.clear
+        utils._get_engine_cached.clear = lambda: calls.__setitem__("n", calls["n"] + 1)
+        try:
+            fake = SimpleNamespace(url=SimpleNamespace(drivername="sqlite"))
+            with patch.object(utils, "_real_db_configured", return_value=True), \
+                 patch.object(utils, "_get_engine_cached", side_effect=lambda *_a, **_k: fake):
+                utils.get_engine()
+        finally:
+            utils._get_engine_cached.clear = real_clear
+        self.assertEqual(calls["n"], 0)
+
+    def test_sqlite_deployments_never_pay_for_a_pointless_retry(self):
+        # Local dev and the e2e sandbox run on SQLite legitimately; retrying
+        # a "real" database that was never configured would be pure cost.
+        with patch.object(utils, "_get_secret", return_value="sqlite:///x.db"):
+            self.assertFalse(utils._real_db_configured())
+
+    def test_a_configured_postgres_url_counts_as_a_real_database(self):
+        with patch.object(utils, "_get_secret",
+                          return_value="postgresql+psycopg2://u:p@h:5432/db"):
+            self.assertTrue(utils._real_db_configured())
 
 
 if __name__ == "__main__":

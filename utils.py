@@ -435,9 +435,60 @@ def _get_engine_cached(_db_url_hash: str = ""):
         return create_engine(fallback_url, echo=False)
 
 
+# How long to wait before re-attempting the real database after falling back
+# to SQLite. Tunable via the DB_RETRY_SECONDS secret.
+DB_FALLBACK_RETRY_SECONDS = max(15, config.get_secret_int("DB_RETRY_SECONDS", 120))
+
+_fallback_retry_state = {"last_attempt": 0.0, "lock": threading.Lock()}
+
+
+def _real_db_configured() -> bool:
+    """True when DATABASE_URL names a real (non-SQLite) database.
+
+    Guards the retry below so a deployment that legitimately runs on SQLite
+    (local dev, the e2e sandbox) never pays for a pointless reconnect.
+    """
+    try:
+        url = _normalize_postgres_url(_get_secret("DATABASE_URL", ""))
+        return bool(url) and not url.startswith("sqlite")
+    except Exception:
+        return False
+
+
 def get_engine():
-    """Return the cached engine, automatically re-creating it if the DATABASE_URL secret changed."""
-    return _get_engine_cached(_get_engine_url_hash())
+    """Return the cached engine, re-creating it if DATABASE_URL changed.
+
+    Also SELF-HEALS. _get_engine_cached is an @st.cache_resource, so once a
+    connection failure drops us onto the SQLite fallback that fallback is
+    cached for the life of the process: the real database coming back does
+    nothing, and every blip needs a manual "Reboot app". That is the wrong
+    failure mode for an event where the door staff are checking people in.
+
+    So when we're on the fallback but a real database IS configured, retry
+    it every DB_FALLBACK_RETRY_SECONDS by clearing the cached resource. The
+    cooldown matters: a failed retry costs a connect timeout, so without it
+    every page load would stall on a dead host.
+    """
+    engine = _get_engine_cached(_get_engine_url_hash())
+    if not engine.url.drivername.startswith("sqlite"):
+        return engine
+    if not _real_db_configured():
+        return engine
+
+    now = time.time()
+    with _fallback_retry_state["lock"]:
+        if now - _fallback_retry_state["last_attempt"] < DB_FALLBACK_RETRY_SECONDS:
+            return engine
+        _fallback_retry_state["last_attempt"] = now
+    try:
+        _get_engine_cached.clear()
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"could not clear the cached engine for retry: {e}")
+        return engine
+    retried = _get_engine_cached(_get_engine_url_hash())
+    if not retried.url.drivername.startswith("sqlite"):
+        print("DATABASE_URL reachable again — recovered from the SQLite fallback")
+    return retried
 
 
 def _using_fallback_db() -> bool:
