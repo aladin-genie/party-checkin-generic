@@ -68,5 +68,6 @@ screenshots/
 test_party.db
 e2e_results/
 
-# Handoff file containing credentials — do not commit
+# Handoff files containing credentials — do not commit
 REVIEW_HANDOFF.md
+LLM_HANDOVER.md
