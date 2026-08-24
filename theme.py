@@ -3015,22 +3015,33 @@ def seat_breakdown(selected) -> str:
     return f'<div class="seat-breakdown">{"".join(lines)}</div>' if lines else ""
 
 
-def guest_names_requirement(ticket_count: int, provided: int = 0) -> str:
-    """The live note telling the guest how many names their tickets need.
+def guest_names_requirement(ticket_count: int, provided: int = 0, kid_count: int = 0) -> str:
+    """The live note telling the guest how many names their party needs.
 
-    `ticket_count` is the current value of the Register page's ticket
-    selector (which lives outside the form, so changing it re-renders this);
-    `provided` is how many names are currently saved for the booking, used
-    only to show progress after a failed submit — a fresh form passes 0.
+    `ticket_count` is the current value of the Register page's paid-seat
+    picker (which lives outside the form, so changing it re-renders this).
+    `kid_count` is how many FREE under-12 child seats are on the same
+    booking (see config.is_free_kid_seat()) — kids are not tickets and not
+    revenue, but they ARE people walking through the door, so they belong in
+    the party counted here even though they never count toward
+    `ticket_count`. Defaults to 0 so a caller that never deals in kid seats
+    sees no change in behavior. `provided` is how many names are currently
+    saved for the booking, used only to show progress after a failed submit
+    — a fresh form passes 0.
 
-    One ticket per person means a booking of N tickets is the registrant plus
-    N-1 named guests, which is exactly what utils.validate_registration
+    The booker holds one place; everyone else in the party — paid adult or
+    free child — needs a name, which is exactly what
+    utils.validate_registration (via utils.additional_guests_expected)
     enforces. Stating it here, in the same words and before the field, is the
     difference between a guest who fills it in correctly and one who submits
-    and gets an error.
+    and gets an error. A booking of 1 paid seat + 1 free child seat is a
+    party of 2 and must land in the "needs a name" branch below, NOT the
+    is-solo branch — ticket_count alone being 1 is not the same as being the
+    only person on the booking.
     """
     tickets = int(ticket_count)
-    needed = max(tickets - 1, 0)
+    kids = int(kid_count)
+    needed = max(tickets + kids - 1, 0)
 
     if needed == 0:
         return (
@@ -3044,10 +3055,20 @@ def guest_names_requirement(ticket_count: int, provided: int = 0) -> str:
     people_word = "guest" if needed == 1 else "guests"
     name_word = "name" if needed == 1 else "names"
     progress = f" You've entered {int(provided)} so far." if provided else ""
+    # Never describe a mixed booking as just "N tickets" — that undercounts
+    # the party by the kids and is exactly the confusion this function
+    # exists to prevent (see AGENTS.md / the bug this fixed).
+    if kids:
+        size_phrase = (
+            f"{tickets} {'seat' if tickets == 1 else 'seats'} plus "
+            f"{kids} child {'seat' if kids == 1 else 'seats'}"
+        )
+    else:
+        size_phrase = f"{tickets} {'ticket' if tickets == 1 else 'tickets'}"
     return (
         '<div class="guest-req">'
         '<span class="guest-req-icon">👥</span>'
-        f"<span>{tickets} tickets covers <strong>you plus "
+        f"<span>{size_phrase} covers <strong>you plus "
         f'<span class="guest-req-count">{needed}</span> other {people_word}</strong> — '
         f"please enter their {name_word} below, one per line.{html.escape(progress)}</span>"
         "</div>"
@@ -3343,13 +3364,14 @@ def guest_identity_card(guest: dict, bands: int, status_label: str, status: str 
 
     rows.append(("Wristbands", str(bands), True))
 
-    # Names are collected at registration, one per ticket beyond the booker
-    # (see utils.additional_guests_expected), so door staff can read the
-    # whole party off this card. Bookings made before names were required
-    # can still be short — say so plainly rather than silently listing
-    # fewer people than are standing there.
+    # Names are collected at registration, one per paid seat or free child
+    # seat beyond the booker (see utils.additional_guests_expected) — kid
+    # seats count here even though they're not tickets, because the child
+    # is still a person the door needs a name for. Bookings made before
+    # names were required can still be short — say so plainly rather than
+    # silently listing fewer people than are standing there.
     extra_names = [n for n in (guest.get("plus_one_name") or "").split("\n") if n.strip()]
-    expected = max(tickets - 1, 0)
+    expected = max(tickets + len(kid_seats) - 1, 0)
     if extra_names or expected:
         label = f"Additional guests ({len(extra_names)} of {expected})"
         value = ", ".join(extra_names) if extra_names else "— none on file"

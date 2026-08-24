@@ -340,6 +340,36 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(stats["revenue"], 300.0)  # $100 + $50 + $150 for the three bookings
         session.close()
 
+    def test_stats_unnamed_tickets_folds_in_kid_seats(self):
+        """unnamed_tickets must count free child seats toward the expected
+        name total, not just tickets — otherwise a fully-named kid booking
+        contributes a NEGATIVE amount to the aggregate (its named count
+        exceeds tickets - 1) that can mask a genuine deficit on an
+        unrelated legacy row, since the max(..., 0) clamp only applies to
+        the final sum, not per row."""
+        session = get_db()
+        # Legacy-style short booking: 3 tickets, only 1 name — a real
+        # deficit of 2 additional names.
+        session.add(Guest(
+            name="Legacy Short", email="legacyshort@test.com",
+            ticket_count=3, plus_one_name="Eve",
+            zelle_ref="ZELLE-LEGSHORT", qr_code=generate_qr_code(),
+        ))
+        # Fully-compliant kid booking: 1 paid seat + 1 free kid seat is a
+        # party of 2, correctly named with exactly 1 additional name.
+        session.add(Guest(
+            name="Solo Parent", email="soloparentkid2@test.com",
+            ticket_count=1, kid_seat_numbers="90", plus_one_name="Kid Name",
+            zelle_ref="ZELLE-KIDSTAT1", qr_code=generate_qr_code(),
+        ))
+        session.commit()
+
+        stats = get_stats()
+        # tickets: 3 + 1 = 4. kid seats: 1. bookings: 2. named: 1 + 1 = 2.
+        # Correct gap: (4 + 1) - 2 - 2 = 1 (all from the legacy row).
+        self.assertEqual(stats["unnamed_tickets"], 1)
+        session.close()
+
     def test_visit_stats(self):
         # Record a few visits from different tokens
         record_visit("token-abc", "Home")
@@ -1994,6 +2024,19 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(utils.additional_guests_expected(None), 0)
         self.assertEqual(utils.additional_guests_expected("nope"), 0)
 
+    def test_additional_guests_expected_folds_in_free_kid_seats(self):
+        """A free child seat is not a ticket, but it IS a person the door
+        needs a name for — kid_count has to widen the party the same way
+        an extra paid seat would. kid_count defaults to 0 so every
+        pre-existing call site (paid-only) keeps its old behavior."""
+        # 1 paid seat + 1 kid seat is a party of 2: the booker plus 1 name.
+        self.assertEqual(utils.additional_guests_expected(1, kid_count=1), 1)
+        # 2 paid seats + 2 kid seats is a party of 4: the booker plus 3 names.
+        self.assertEqual(utils.additional_guests_expected(2, kid_count=2), 3)
+        # Default kid_count=0 must reproduce exactly today's behavior.
+        self.assertEqual(utils.additional_guests_expected(1), 0)
+        self.assertEqual(utils.additional_guests_expected(4), 3)
+
     def test_guest_names_list_and_count(self):
         self.assertEqual(utils.guest_names_list("Ann Lee\nBob Ray"), ["Ann Lee", "Bob Ray"])
         self.assertEqual(utils.guest_name_count("Ann Lee\nBob Ray"), 2)
@@ -3253,6 +3296,42 @@ class TestPartyCheckIn(unittest.TestCase):
         html_out = theme.guest_identity_card(guest, bands=1, status_label="Not checked in yet")
         self.assertNotIn("Child seats", html_out)
 
+    def test_guest_identity_card_expected_names_folds_in_kid_seats(self):
+        """The door card's "Additional guests (N of expected)" row must
+        count free child seats toward `expected`, not just tickets — a
+        1-ticket + 1-kid-seat booking is a party of 2, so `expected` must
+        be 1, not 0 (which would hide that a name is still owed)."""
+        guest = {
+            "name": "Solo Parent", "email": "soloparentkid@example.com",
+            "ticket_count": 1, "seats": [1], "kid_seats": [90],
+            "plus_one_name": "",
+        }
+        html_out = theme.guest_identity_card(guest, bands=2, status_label="Not checked in yet")
+        self.assertIn("Additional guests (0 of 1)", html_out)
+
+    # ── Guest-name requirement note (theme.guest_names_requirement) ────────
+    # The live copy above the Register page's name field — this is the exact
+    # UI the organiser's bug report was about: 1 paid seat + 1 free child
+    # seat must NOT read as "Just you on this booking".
+
+    def test_guest_names_requirement_paid_plus_kid_is_not_solo(self):
+        html_out = theme.guest_names_requirement(1, kid_count=1)
+        self.assertNotIn("is-solo", html_out)
+        self.assertNotIn("Just you on this booking", html_out)
+        self.assertIn('<span class="guest-req-count">1</span>', html_out)
+        self.assertIn("1 seat", html_out)
+        self.assertIn("1 child seat", html_out)
+
+    def test_guest_names_requirement_genuine_solo_still_renders_solo_copy(self):
+        html_out = theme.guest_names_requirement(1)
+        self.assertIn("is-solo", html_out)
+        self.assertIn("Just you on this booking", html_out)
+
+        # Same result with kid_count explicitly 0.
+        html_out2 = theme.guest_names_requirement(1, kid_count=0)
+        self.assertIn("is-solo", html_out2)
+        self.assertIn("Just you on this booking", html_out2)
+
     # ── Seat pricing table: wording + real total (money-bug fix) ───────────
     # price_tier_table() used to read like a per-booking group-discount rate
     # ("26-75 tickets $25.00 each"), which sat directly above the Zelle
@@ -3748,21 +3827,62 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertNotIn("kid_seat_numbers", cleaned)
         self.assertNotIn("kid_seat_numbers", errors)
 
-    def test_validate_registration_kid_seats_derives_correct_ticket_count_and_names(self):
-        """Kid seats must NOT count toward ticket_count or the guest-name
-        requirement — only paid seats do."""
+    def test_validate_registration_kid_seats_derive_ticket_count_but_join_the_name_requirement(self):
+        """Kid seats must NOT count toward ticket_count (they're free, not
+        revenue) — but they MUST count toward the guest-name requirement,
+        since a free child is still a person the door needs a name for.
+        2 paid seats + 1 kid seat is a party of 3, needing 2 other names."""
+        # Only 1 name for a 2-paid+1-kid booking (party of 3, needs 2) must
+        # be rejected — this is the exact bug the organiser reported: kid
+        # seats being silently excluded from the name count.
         cleaned, errors = validate_registration(
             name="Two Adults One Kid", email="twoadultsonekid@test.com",
             phone="+1-555-333-7777", plus_one_name=_guest_name(0),
             zelle_ref="ZELLE-2AD1KID1", agree_terms=True,
             seat_numbers=[1, 2], kid_seat_numbers=[90],
         )
-        self.assertNotIn("seat_numbers", errors)
-        self.assertNotIn("plus_one_name", errors)
-        self.assertNotIn("kid_seat_numbers", errors)
+        self.assertIn("plus_one_name", errors)
         self.assertEqual(cleaned["ticket_count"], 2)
         self.assertEqual(cleaned["kid_seat_numbers"], [90])
         self.assertEqual(cleaned["kid_count"], 1)
+
+        # Naming both other people (1 paid guest + 1 child) is accepted.
+        cleaned2, errors2 = validate_registration(
+            name="Two Adults One Kid", email="twoadultsonekid@test.com",
+            phone="+1-555-333-7777",
+            plus_one_name="\n".join([_guest_name(0), _guest_name(1)]),
+            zelle_ref="ZELLE-2AD1KID1", agree_terms=True,
+            seat_numbers=[1, 2], kid_seat_numbers=[90],
+        )
+        self.assertNotIn("seat_numbers", errors2)
+        self.assertNotIn("plus_one_name", errors2)
+        self.assertNotIn("kid_seat_numbers", errors2)
+        self.assertEqual(cleaned2["ticket_count"], 2)
+        self.assertEqual(cleaned2["kid_seat_numbers"], [90])
+        self.assertEqual(cleaned2["kid_count"], 1)
+        self.assertEqual(cleaned2["additional_guest_count"], 2)
+
+    def test_validate_registration_one_paid_one_kid_requires_exactly_one_name(self):
+        """The organiser's reported bug, locked in as a test: 1 paid seat +
+        1 free child seat is a party of 2 (the booker plus the child), not
+        "just you" — it must reject zero names and accept exactly one."""
+        cleaned, errors = validate_registration(
+            name="Solo Parent", email="soloparentkid@test.com",
+            phone="+1-555-444-8888", plus_one_name="",
+            zelle_ref="ZELLE-SOLOKID1", agree_terms=True,
+            seat_numbers=[1], kid_seat_numbers=[90],
+        )
+        self.assertIn("plus_one_name", errors)
+        self.assertEqual(cleaned["additional_guest_count"], 0)
+
+        cleaned2, errors2 = validate_registration(
+            name="Solo Parent", email="soloparentkid@test.com",
+            phone="+1-555-444-8888", plus_one_name=_guest_name(0),
+            zelle_ref="ZELLE-SOLOKID1", agree_terms=True,
+            seat_numbers=[1], kid_seat_numbers=[90],
+        )
+        self.assertNotIn("plus_one_name", errors2)
+        self.assertEqual(cleaned2["additional_guest_count"], 1)
 
     def test_taken_seats_includes_kid_seats_and_blocks_a_second_booking_either_way(self):
         """The double-booking guard: a free kid seat must be just as

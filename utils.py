@@ -117,19 +117,21 @@ class Guest(Base):
     # for 512 chars, comfortably enough for a booking of all 100 seats.
     #
     # DEFINITION: these are PAID seats only. ticket_count == len(seat_numbers)
-    # for a seat-picking booking (see register_guest()), and this is the
-    # count additional_guests_expected()/guest-name validation is driven by.
-    # See kid_seat_numbers below for the FREE counterpart, which is
-    # deliberately excluded from all three.
+    # for a seat-picking booking (see register_guest()). additional_guests_
+    # expected()/guest-name validation is driven by seat_numbers PLUS
+    # kid_seat_numbers (see below) — a free child seat is still a person the
+    # door needs a name for, even though it stays out of ticket_count.
     seat_numbers = Column(String(512), default="")
     # Comma-joined, ascending FREE under-12 child seat numbers on this
     # booking — same string format as seat_numbers (see
     # utils.kid_seat_numbers_list()/format_seat_numbers()), but a SEPARATE
     # column and a separate concept (see config.is_free_kid_seat() /
     # AGENTS.md's kids-ticket rule):
-    #   * NOT a ticket — ticket_count and the guest-name requirement
-    #     (additional_guests_expected()) are driven by seat_numbers alone; a
-    #     child seat never requires a name.
+    #   * NOT a ticket — ticket_count is driven by seat_numbers alone, so a
+    #     child seat never adds a ticket or moves a pricing tier. It DOES
+    #     still add to the guest-name requirement (additional_guests_
+    #     expected()) — the child is a real person on the guest list, just
+    #     not a paying one.
     #   * NOT revenue — a seat in here is $0 (see config.is_free_kid_seat());
     #     _expected_revenue_cents() reads only Guest.seat_numbers.
     #   * STILL a real occupied seat — taken_seats(), seat_availability(),
@@ -1123,6 +1125,27 @@ def _named_guests_expr():
     )
 
 
+def _kid_count_expr():
+    """SQL expression: how many FREE under-12 child seats one row holds.
+
+    kid_seat_numbers holds seat numbers comma-joined (see
+    format_seat_numbers()), so the count is "commas + 1" — the same
+    portable length-minus-length-without-the-separator trick as
+    _named_guests_expr() above, just on commas instead of newlines. A
+    blank/NULL column counts as 0, not 1. Used by get_stats() to fold kid
+    seats into unnamed_tickets: they're not tickets (see
+    Guest.kid_seat_numbers), but they DO count toward the guest-name
+    requirement (additional_guests_expected()), so leaving them out here
+    would understate — or even mask, via a negative per-row contribution
+    before the final clamp — how many names are actually missing.
+    """
+    kids = func.coalesce(Guest.kid_seat_numbers, "")
+    return case(
+        (kids == "", 0),
+        else_=func.length(kids) - func.length(func.replace(kids, ",", "")) + 1,
+    )
+
+
 def _expected_revenue_cents(session) -> int:
     """Total the guest list should have brought in, in cents.
 
@@ -1189,7 +1212,9 @@ def get_stats() -> dict:
     Head counts, all of which differ and all of which an organiser asks for:
     total_guests is bookings (rows), total_tickets is people paid for,
     named_guests is the additional people actually named on those bookings,
-    and unnamed_tickets is the gap between the two — non-zero only for
+    and unnamed_tickets is the gap between the two — folding in free child
+    seats (see _kid_count_expr) as well as paid tickets, since a kid seat
+    needs a name just as much as a paid one does. Non-zero only for
     bookings made before guest names were required, since
     validate_registration() now refuses a mismatch.
 
@@ -1214,6 +1239,7 @@ def get_stats() -> dict:
                 ),
                 func.coalesce(func.sum(case((Guest.plus_one_name != "", 1), else_=0)), 0),
                 func.coalesce(func.sum(_named_guests_expr()), 0),
+                func.coalesce(func.sum(_kid_count_expr()), 0),
             ).one()
 
             total = int(row[0])
@@ -1223,9 +1249,16 @@ def get_stats() -> dict:
             admitted_tickets = int(row[4])
             plus_one_count = int(row[5])
             named_guests = int(row[6])
+            kid_total = int(row[7])
             # Clamped: a row hand-edited to name more people than it has
-            # tickets would otherwise report a negative gap.
-            unnamed_tickets = max(tickets - total - named_guests, 0)
+            # tickets would otherwise report a negative gap. Kid seats fold
+            # in here too (see _kid_count_expr) — a free child seat is not
+            # a ticket, but it IS a name the door expects, same as a paid
+            # seat, so leaving it out would understate the true gap (and a
+            # fully-named kid booking would otherwise contribute a negative
+            # per-row amount that could mask a genuine deficit elsewhere,
+            # since the clamp only applies to the SUM, not per row).
+            unnamed_tickets = max(tickets + kid_total - total - named_guests, 0)
 
             # Average tickets per guest
             avg_tickets = round(tickets / total, 2) if total else 0.0
@@ -2924,19 +2957,33 @@ def guest_name_count(value: str) -> int:
     return len(guest_names_list(value))
 
 
-def additional_guests_expected(ticket_count) -> int:
-    """How many additional guest names a booking of `ticket_count` needs.
+def additional_guests_expected(ticket_count, kid_count=0) -> int:
+    """How many additional guest names a booking needs.
 
     One ticket is the person filling in the form, so a 4-ticket booking is
-    the registrant plus 3 named guests. This is the single definition of
-    that rule — validate_registration() enforces it, and the UI reads it to
-    tell the guest up front how many names to type.
+    the registrant plus 3 named guests. Free under-12 child seats
+    (`kid_count`) are not tickets and not revenue (see
+    config.is_free_kid_seat()), but the children ARE people walking through
+    the door, so they belong in the party the booker has to name too: a
+    booking of `ticket_count` paid seats plus `kid_count` free child seats
+    is the registrant plus (ticket_count + kid_count - 1) other named
+    people. `kid_count` defaults to 0 so every existing caller — anything
+    that only ever dealt in paid tickets — keeps its exact previous
+    behavior.
+
+    This is the single definition of that rule — validate_registration()
+    enforces it, and the UI reads it to tell the guest up front how many
+    names to type.
     """
     try:
         tickets = int(ticket_count)
     except (TypeError, ValueError):
         tickets = 1
-    return max(tickets - 1, 0)
+    try:
+        kids = int(kid_count)
+    except (TypeError, ValueError):
+        kids = 0
+    return max(tickets + kids - 1, 0)
 
 
 def _kid_count(guest: dict) -> int:
@@ -3307,21 +3354,25 @@ def validate_registration(
     cleaned["kid_seat_numbers"] holds the normalised list of ints,
     cleaned["kid_seat_numbers_str"] the comma-joined string form, and
     cleaned["kid_count"] its length. Kid seats do NOT count toward
-    ticket_count, the guest-name requirement below, or revenue — see the
-    Guest.kid_seat_numbers column comment. Leaving `kid_seat_numbers` as None
-    (the default) adds none of these keys and behaves exactly as before this
-    parameter existed.
+    ticket_count or revenue — see the Guest.kid_seat_numbers column comment
+    — but they DO count toward the guest-name requirement below (see the
+    next paragraph): a free child seat is still a person walking through
+    the door, and the door needs their name same as anyone else's. Leaving
+    `kid_seat_numbers` as None (the default) adds none of these keys and
+    behaves exactly as before this parameter existed.
 
-    Guest names are validated AGAINST the (possibly seat-derived) ticket
-    count: a booking of N tickets is the registrant plus N-1 other people, so
-    exactly N-1 additional names are required (see
+    Guest names are validated AGAINST the whole party — the (possibly
+    seat-derived) ticket count PLUS any free kid seats: a booking of N paid
+    seats and K free child seats is the registrant plus (N + K - 1) other
+    people, so exactly that many additional names are required (see
     additional_guests_expected). Names used to be free-form and optional,
     which meant a 6-ticket booking could arrive with nobody named — the
     organiser then had no idea who the other five people were, and the door
     had no list to check against. Requiring them here is the only point in
-    the flow where the guest is still present to answer. Kid seats are
-    deliberately NOT named — the ticket count (and therefore the name
-    requirement) is driven only by `seat_numbers`.
+    the flow where the guest is still present to answer. A booking of 1
+    paid seat + 1 free child seat is a party of 2 and needs exactly 1 name
+    (the child's) — it is NOT "1 ticket, no names needed"; that was the
+    exact bug this rule used to have (see AGENTS.md).
 
     This replaces the validation that used to be duplicated twice in
     streamlit_app.page_register (once inside the st.form block, once after
@@ -3390,78 +3441,15 @@ def validate_registration(
             errors["ticket_count"] = f"Please choose between 1 and {max_tickets} tickets."
             tickets_clean = min(max(tickets_clean, 1), max_tickets)
 
-    names, names_reason = parse_guest_names(plus_one_name or "")
-    expected = additional_guests_expected(tickets_clean)
-    plus_one_clean = "\n".join(names)
-
-    if names_reason == "invalid":
-        plus_one_clean = ""
-        errors["plus_one_name"] = "Guest names must use letters and spaces only, one per line."
-    elif names_reason == "too_many":
-        plus_one_clean = ""
-        errors["plus_one_name"] = f"That's more than {MAX_GUEST_NAMES} names — please list at most {MAX_GUEST_NAMES}."
-    elif len(names) != expected:
-        # The count is the whole point of the field, so say exactly what was
-        # counted and exactly what's needed — "invalid input" would leave the
-        # guest guessing which of the two numbers to change.
-        got = len(names)
-        needed_word = "name" if expected == 1 else "names"
-        if got == 0:
-            errors["plus_one_name"] = (
-                f"{tickets_clean} tickets covers you plus {expected} other "
-                f"{'guest' if expected == 1 else 'guests'} — please enter their "
-                f"{needed_word}, one per line."
-            )
-        elif got < expected:
-            missing = expected - got
-            errors["plus_one_name"] = (
-                f"{tickets_clean} tickets needs {expected} additional guest {needed_word}, "
-                f"but you listed {got}. Please add the {missing} missing "
-                f"{'name' if missing == 1 else 'names'}, or lower the ticket count above."
-            )
-        else:
-            # More names than tickets. Says "raise the ticket count" without
-            # promising it's possible — the selector is capped by how many
-            # tickets are actually left, so a guest at the cap can only take
-            # the other branch (remove names).
-            extra = got - expected
-            covered = "only booked 1 ticket" if expected == 0 else f"booked {tickets_clean} tickets"
-            errors["plus_one_name"] = (
-                f"You listed {got} guest {'name' if got == 1 else 'names'} but {covered}. "
-                "Everyone coming needs their own ticket — raise the ticket count above, "
-                f"or remove {extra} {'name' if extra == 1 else 'names'}."
-            )
-
-    zelle_clean = sanitize_zelle_ref(zelle_ref or "")
-    if not zelle_clean:
-        errors["zelle_ref"] = "Zelle transaction reference is required (8-30 letters, digits, hyphens)."
-
-    if not agree_terms:
-        errors["terms"] = "Please check I/We Agree in the Terms & Conditions to continue."
-
-    cleaned = {
-        "name": name_clean,
-        "email": email_clean,
-        "phone": phone_clean,
-        "ticket_count": tickets_clean,
-        "plus_one_name": plus_one_clean,
-        # How many people the booker added beyond themselves. Equal to
-        # tickets_clean - 1 whenever `errors` is empty; kept as its own key so
-        # the caller reports what was actually counted rather than re-deriving
-        # it from a field that may have failed validation.
-        "additional_guest_count": len(names) if not errors.get("plus_one_name") else 0,
-        "zelle_ref": zelle_clean,
-        "terms": bool(agree_terms),
-    }
-    if seat_numbers is not None:
-        cleaned["seat_numbers"] = seats_clean
-        cleaned["seat_numbers_str"] = format_seat_numbers(seats_clean)
-
     # Free under-12 child seats. Validated against the paid-seat list above
     # (`seats_clean`, which is None unless `seat_numbers` was itself
     # provided) — kid seats only make sense on a seat-picking booking, and a
     # booking with no explicit paid seats is treated the same as "no paid
-    # seat" for the "child can't book alone" rule below.
+    # seat" for the "child can't book alone" rule below. This has to run
+    # BEFORE the guest-name check further down: free child seats are not
+    # tickets and not revenue, but they ARE people walking through the door,
+    # so the name requirement (additional_guests_expected) has to count them
+    # too — see AGENTS.md / config.is_free_kid_seat().
     kid_seats_clean = None
     if kid_seat_numbers is not None:
         parsed_kids, kid_reason = parse_seat_selection(kid_seat_numbers)
@@ -3509,9 +3497,98 @@ def validate_registration(
 
         if kid_seats_clean is None:
             kid_seats_clean = []
+
+    # 0 when kid_seat_numbers was never passed (the plain quantity/legacy
+    # path) — same default additional_guests_expected() itself uses, so a
+    # caller that never touches kid seats sees no change in behavior.
+    kid_count_clean = len(kid_seats_clean) if kid_seats_clean is not None else 0
+
+    names, names_reason = parse_guest_names(plus_one_name or "")
+    expected = additional_guests_expected(tickets_clean, kid_count_clean)
+    plus_one_clean = "\n".join(names)
+
+    # The phrase used to describe the booking size in the messages below.
+    # Plain "N tickets" when there are no free child seats (unchanged
+    # wording); "N seats plus M child seats" when there are — a mixed
+    # booking must never be described as just "N tickets", that undercounts
+    # the party by the number of kids and is the exact bug being fixed here
+    # (see AGENTS.md — kid seats are free and NOT tickets, but they are
+    # still people the door needs a name for).
+    if kid_count_clean:
+        party_phrase = (
+            f"{tickets_clean} {'seat' if tickets_clean == 1 else 'seats'} plus "
+            f"{kid_count_clean} child {'seat' if kid_count_clean == 1 else 'seats'}"
+        )
+    else:
+        party_phrase = f"{tickets_clean} {'ticket' if tickets_clean == 1 else 'tickets'}"
+
+    if names_reason == "invalid":
+        plus_one_clean = ""
+        errors["plus_one_name"] = "Guest names must use letters and spaces only, one per line."
+    elif names_reason == "too_many":
+        plus_one_clean = ""
+        errors["plus_one_name"] = f"That's more than {MAX_GUEST_NAMES} names — please list at most {MAX_GUEST_NAMES}."
+    elif len(names) != expected:
+        # The count is the whole point of the field, so say exactly what was
+        # counted and exactly what's needed — "invalid input" would leave the
+        # guest guessing which of the two numbers to change.
+        got = len(names)
+        needed_word = "name" if expected == 1 else "names"
+        if got == 0:
+            errors["plus_one_name"] = (
+                f"{party_phrase} covers you plus {expected} other "
+                f"{'guest' if expected == 1 else 'guests'} — please enter their "
+                f"{needed_word}, one per line."
+            )
+        elif got < expected:
+            missing = expected - got
+            errors["plus_one_name"] = (
+                f"{party_phrase} needs {expected} additional guest {needed_word}, "
+                f"but you listed {got}. Please add the {missing} missing "
+                f"{'name' if missing == 1 else 'names'}, or lower the ticket count above."
+            )
+        else:
+            # More names than tickets. Says "raise the ticket count" without
+            # promising it's possible — the selector is capped by how many
+            # tickets are actually left, so a guest at the cap can only take
+            # the other branch (remove names).
+            extra = got - expected
+            covered = "only booked 1 ticket" if expected == 0 else f"booked {party_phrase}"
+            errors["plus_one_name"] = (
+                f"You listed {got} guest {'name' if got == 1 else 'names'} but {covered}. "
+                "Everyone coming needs their own ticket — raise the ticket count above, "
+                f"or remove {extra} {'name' if extra == 1 else 'names'}."
+            )
+
+    zelle_clean = sanitize_zelle_ref(zelle_ref or "")
+    if not zelle_clean:
+        errors["zelle_ref"] = "Zelle transaction reference is required (8-30 letters, digits, hyphens)."
+
+    if not agree_terms:
+        errors["terms"] = "Please check I/We Agree in the Terms & Conditions to continue."
+
+    cleaned = {
+        "name": name_clean,
+        "email": email_clean,
+        "phone": phone_clean,
+        "ticket_count": tickets_clean,
+        "plus_one_name": plus_one_clean,
+        # How many people the booker added beyond themselves. Equal to
+        # tickets_clean - 1 whenever `errors` is empty; kept as its own key so
+        # the caller reports what was actually counted rather than re-deriving
+        # it from a field that may have failed validation.
+        "additional_guest_count": len(names) if not errors.get("plus_one_name") else 0,
+        "zelle_ref": zelle_clean,
+        "terms": bool(agree_terms),
+    }
+    if seat_numbers is not None:
+        cleaned["seat_numbers"] = seats_clean
+        cleaned["seat_numbers_str"] = format_seat_numbers(seats_clean)
+
+    if kid_seat_numbers is not None:
         cleaned["kid_seat_numbers"] = kid_seats_clean
         cleaned["kid_seat_numbers_str"] = format_seat_numbers(kid_seats_clean)
-        cleaned["kid_count"] = len(kid_seats_clean)
+        cleaned["kid_count"] = kid_count_clean
 
     return cleaned, errors
 

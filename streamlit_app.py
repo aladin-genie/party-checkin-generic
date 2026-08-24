@@ -880,12 +880,18 @@ def page_register():
     # How many other people this booking has to name, stated before the field
     # rather than after a rejected submit. Lives outside the form alongside
     # the selector, so changing the ticket count updates it immediately —
-    # utils.validate_registration enforces exactly this count.
-    names_required = utils.additional_guests_expected(ticket_count)
+    # utils.validate_registration enforces exactly this count. Free child
+    # seats are not tickets and not revenue, but they ARE people walking
+    # through the door, so kid_count has to feed this too — a booking of 1
+    # paid seat + 1 free child seat is a party of 2, not "just you" (see
+    # AGENTS.md / the "kid seat name" bug this fixed).
+    kid_count = len(selected_kid_seats)
+    names_required = utils.additional_guests_expected(ticket_count, kid_count)
     st.markdown(
         theme.guest_names_requirement(
             ticket_count,
             utils.count_guest_name_entries(st.session_state.get("reg_plus_one", "")),
+            kid_count,
         ),
         unsafe_allow_html=True,
     )
@@ -931,16 +937,32 @@ def page_register():
             st.markdown(theme.field_error(reg_errors["phone"]), unsafe_allow_html=True)
 
         # Label and help both restate the required count, because this is
-        # the one field whose correctness depends on a control that sits
-        # outside the form (the ticket selector above). Changing that
-        # selector reruns the script, so this label re-renders with it.
+        # the one field whose correctness depends on controls that sit
+        # outside the form (the paid- and kid-seat pickers above). Changing
+        # either reruns the script, so this label re-renders with it. This
+        # can only land in the "not needed" branch below for a genuine
+        # solo booking (1 paid seat, 0 kid seats) — the moment a kid seat
+        # is added, names_required is at least 1 (see
+        # utils.additional_guests_expected), so a 1-paid + 1-kid booking
+        # always gets the "required" label, never the disabled one.
         if names_required:
             names_label = (
                 f"Additional Guest Names — {names_required} "
                 f"{'name' if names_required == 1 else 'names'} required *"
             )
+            # Never say "you booked N tickets" when kid seats are also on
+            # the booking — that undercounts the party by the kids, which
+            # is the exact confusion the organiser reported (see
+            # AGENTS.md).
+            if kid_count:
+                booked_phrase = (
+                    f"{ticket_count} {'seat' if ticket_count == 1 else 'seats'} plus "
+                    f"{kid_count} child {'seat' if kid_count == 1 else 'seats'}"
+                )
+            else:
+                booked_phrase = f"{ticket_count} {'ticket' if ticket_count == 1 else 'tickets'}"
             names_help = (
-                f"One name per line (or comma-separated). You booked {ticket_count} tickets, "
+                f"One name per line (or comma-separated). You booked {booked_phrase}, "
                 f"so we need the {names_required} other "
                 f"{'guest' if names_required == 1 else 'guests'} by name — letters and spaces only."
             )
