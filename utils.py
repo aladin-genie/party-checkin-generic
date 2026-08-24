@@ -234,6 +234,33 @@ def _get_engine_url_hash() -> str:
     return hashlib.sha256(db_url.encode("utf-8")).hexdigest()[:16]
 
 
+# How long to wait for a Postgres connection before giving up.
+#
+# This MUST be set. Without it psycopg2 inherits the OS TCP timeout — well
+# over a minute on Linux — so a paused Supabase project doesn't produce an
+# error, it produces a HANG: ensure_db_ready() never returns, the Streamlit
+# script never finishes, and every visitor gets a permanently blank page with
+# no error anywhere to explain it. That is exactly how this app failed in
+# production. A short timeout turns "unreachable database" into a fast,
+# handled failure that falls back to SQLite below, so the app still renders.
+#
+# Tunable via the DB_CONNECT_TIMEOUT secret; floored at 1s so a bad value
+# can't reintroduce an unbounded wait.
+DB_CONNECT_TIMEOUT_SECONDS = max(1, config.get_secret_int("DB_CONNECT_TIMEOUT", 5))
+
+
+def _pg_connect_args(db_url: str) -> dict:
+    """Driver-specific connect-timeout kwargs for a Postgres URL.
+
+    psycopg2 takes `connect_timeout` (seconds); pg8000 takes `timeout`.
+    Passing the wrong one raises TypeError at connect time, which would land
+    us right back on the fallback path for the wrong reason.
+    """
+    if "+pg8000" in db_url:
+        return {"timeout": DB_CONNECT_TIMEOUT_SECONDS}
+    return {"connect_timeout": DB_CONNECT_TIMEOUT_SECONDS}
+
+
 @st.cache_resource(show_spinner=False)
 def _get_engine_cached(_db_url_hash: str = ""):
     """Create a cached SQLAlchemy engine keyed by the DATABASE_URL hash.
@@ -259,7 +286,14 @@ def _get_engine_cached(_db_url_hash: str = ""):
     is_postgres = db_url.startswith("postgresql")
     engine_kwargs = {"pool_pre_ping": True, "echo": False}
     if is_postgres:
-        engine_kwargs.update(pool_size=5, max_overflow=10, pool_recycle=1800)
+        engine_kwargs.update(
+            pool_size=5,
+            max_overflow=10,
+            pool_recycle=1800,
+            # Never wait forever for a free pooled connection either.
+            pool_timeout=DB_CONNECT_TIMEOUT_SECONDS,
+            connect_args=_pg_connect_args(db_url),
+        )
 
     try:
         engine = create_engine(db_url, **engine_kwargs)
@@ -275,7 +309,10 @@ def _get_engine_cached(_db_url_hash: str = ""):
             try:
                 pg_url = db_url.replace("postgresql+psycopg2://", "postgresql+pg8000://", 1)
                 print("psycopg2 failed, trying pg8000 driver")
-                engine = create_engine(pg_url, **engine_kwargs)
+                # pg8000 spells the connect timeout differently to psycopg2,
+                # so rebuild connect_args for the driver we're switching to.
+                pg_kwargs = dict(engine_kwargs, connect_args=_pg_connect_args(pg_url))
+                engine = create_engine(pg_url, **pg_kwargs)
                 inspector = inspect(engine)
                 inspector.get_table_names()
                 print("DATABASE_URL connection via pg8000: OK")
