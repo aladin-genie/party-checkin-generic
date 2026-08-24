@@ -3465,6 +3465,282 @@ class TestPartyCheckIn(unittest.TestCase):
         stats = get_stats()
         self.assertEqual(stats["revenue"], 85.0 + 100.0)
 
+    # ── Free kid seats (organiser's rule: under-12 free, but ONLY in the
+    # cheapest SEAT_TIERS tier — see AGENTS.md / config.is_free_kid_seat()) ──
+
+    def test_register_guest_kid_seat_in_cheap_tier_costs_nothing_and_holds_the_seat(self):
+        """The core scenario: paid=[1] + kids=[90] must total $50 (seat 1's
+        price only), not $60 — the kid seat is free but still real
+        inventory (ticket_count/seats stay paid-only, kid_seats is separate)."""
+        result = self._register(name="Bargain Family", email="bargainfamily@test.com",
+                                zelle_ref="ZELLE-BARGFAM1", seat_numbers=[1], kid_seat_numbers=[90])
+        self.assertTrue(result["ok"])
+        guest = result["guest"]
+        self.assertEqual(guest["ticket_count"], 1)
+        self.assertEqual(guest["seats"], [1])
+        self.assertEqual(guest["kid_seats"], [90])
+        # Only the paid seat is priced; the kid seat adds nothing.
+        self.assertEqual(config.seats_total_cents(guest["seats"]), 5000)
+        self.assertEqual(config.seats_total_cents(guest["seats"]) / 100, 50.0)
+
+    def test_expected_revenue_ignores_kid_seats(self):
+        """Revenue must count ONLY the paid seats — a kid seat is $0 by
+        design and must never be added into the Zelle-reconciliation total."""
+        self._register(name="Kid Revenue", email="kidrevenue@test.com",
+                       zelle_ref="ZELLE-KIDREV01",
+                       seat_numbers=[1, 30], kid_seat_numbers=[90, 91])
+        stats = get_stats()
+        # Seats 1 + 30 = $50 + $25 = $75; kid seats 90/91 add nothing.
+        self.assertEqual(stats["revenue"], 75.0)
+
+    def test_validate_registration_kid_seat_outside_cheap_tier_is_rejected(self):
+        """A front-row seat (e.g. 1 or 30) is not free-kid-eligible — the
+        organiser's rule is cheapest tier only. The error must name the
+        actual free-eligible range so the guest knows what to do instead."""
+        for bad_kid_seat in (1, 30):
+            with self.subTest(bad_kid_seat=bad_kid_seat):
+                cleaned, errors = validate_registration(
+                    name="Front Row Kid", email=f"frontrowkid{bad_kid_seat}@test.com",
+                    phone="+1-555-333-1111", plus_one_name="", zelle_ref="ZELLE-FRONTKID",
+                    agree_terms=True, seat_numbers=[50], kid_seat_numbers=[bad_kid_seat],
+                )
+                self.assertIn("kid_seat_numbers", errors)
+                self.assertIn(config.free_kid_seat_range_label(), errors["kid_seat_numbers"])
+
+    def test_validate_registration_kid_seat_cannot_also_be_a_paid_seat(self):
+        """A seat can't be both paid and free on the same booking."""
+        cleaned, errors = validate_registration(
+            name="Double Booked Seat", email="doublebookedseat@test.com",
+            phone="+1-555-333-2222", plus_one_name="", zelle_ref="ZELLE-DBLBOOK1",
+            agree_terms=True, seat_numbers=[90], kid_seat_numbers=[90],
+        )
+        self.assertIn("kid_seat_numbers", errors)
+
+    def test_validate_registration_kid_seats_require_at_least_one_paid_seat(self):
+        """A child cannot book alone — an adult (paid) seat is required on
+        the same booking."""
+        cleaned, errors = validate_registration(
+            name="Lone Kid", email="lonekid@test.com", phone="+1-555-333-3333",
+            plus_one_name="", zelle_ref="ZELLE-LONEKID1", agree_terms=True,
+            seat_numbers=[], kid_seat_numbers=[90],
+        )
+        self.assertIn("kid_seat_numbers", errors)
+
+    def test_validate_registration_blank_kid_seats_is_not_an_error(self):
+        """A booking with no kids at all — the normal case — must not be
+        flagged just because kid_seat_numbers was passed as empty."""
+        cleaned, errors = validate_registration(
+            name="No Kids Here", email="nokidshere@test.com", phone="+1-555-333-4444",
+            plus_one_name="", zelle_ref="ZELLE-NOKIDHR1", agree_terms=True,
+            seat_numbers=[1], kid_seat_numbers=[],
+        )
+        self.assertNotIn("kid_seat_numbers", errors)
+        self.assertEqual(cleaned["kid_seat_numbers"], [])
+        self.assertEqual(cleaned["kid_count"], 0)
+
+    def test_validate_registration_too_many_kid_seats_is_rejected(self):
+        with patch.object(config, "MAX_KIDS_PER_REGISTRATION", 2):
+            cleaned, errors = validate_registration(
+                name="Too Many Kids", email="toomanykids@test.com", phone="+1-555-333-5555",
+                plus_one_name="", zelle_ref="ZELLE-TOOMANY1", agree_terms=True,
+                seat_numbers=[1], kid_seat_numbers=[90, 91, 92],
+            )
+        self.assertIn("kid_seat_numbers", errors)
+
+    def test_validate_registration_without_kid_seat_numbers_behaves_as_before(self):
+        # kid_seat_numbers left at its default (None): no kid-related keys
+        # at all, existing callers unaffected.
+        cleaned, errors = validate_registration(
+            name="No Kids Param", email="nokidsparam@test.com", phone="+1-555-333-6666",
+            plus_one_name="", zelle_ref="ZELLE-NOKIDPRM", agree_terms=True,
+            seat_numbers=[1],
+        )
+        self.assertNotIn("kid_seat_numbers", cleaned)
+        self.assertNotIn("kid_seat_numbers", errors)
+
+    def test_validate_registration_kid_seats_derives_correct_ticket_count_and_names(self):
+        """Kid seats must NOT count toward ticket_count or the guest-name
+        requirement — only paid seats do."""
+        cleaned, errors = validate_registration(
+            name="Two Adults One Kid", email="twoadultsonekid@test.com",
+            phone="+1-555-333-7777", plus_one_name=_guest_name(0),
+            zelle_ref="ZELLE-2AD1KID1", agree_terms=True,
+            seat_numbers=[1, 2], kid_seat_numbers=[90],
+        )
+        self.assertNotIn("seat_numbers", errors)
+        self.assertNotIn("plus_one_name", errors)
+        self.assertNotIn("kid_seat_numbers", errors)
+        self.assertEqual(cleaned["ticket_count"], 2)
+        self.assertEqual(cleaned["kid_seat_numbers"], [90])
+        self.assertEqual(cleaned["kid_count"], 1)
+
+    def test_taken_seats_includes_kid_seats_and_blocks_a_second_booking_either_way(self):
+        """The double-booking guard: a free kid seat must be just as
+        "taken" as a paid one. Two registrations, seat 90 claimed as a kid
+        seat by the first — the second must be refused whether it tries to
+        take seat 90 as a PAID seat or as a KID seat."""
+        first = self._register(name="First Family", email="firstfamily@test.com",
+                               zelle_ref="ZELLE-FIRSTFAM", seat_numbers=[1], kid_seat_numbers=[90])
+        self.assertTrue(first["ok"])
+        self.assertIn(90, utils.taken_seats())
+
+        second_as_paid = self._register(name="Second As Paid", email="secondaspaid@test.com",
+                                        zelle_ref="ZELLE-SECPAID2", seat_numbers=[90])
+        self.assertFalse(second_as_paid["ok"])
+        self.assertEqual(second_as_paid["reason"], "seats_taken")
+        self.assertEqual(second_as_paid["taken"], [90])
+
+        third_as_kid = self._register(name="Third As Kid", email="thirdaskid@test.com",
+                                      zelle_ref="ZELLE-THIRDKID", seat_numbers=[2], kid_seat_numbers=[90])
+        self.assertFalse(third_as_kid["ok"])
+        self.assertEqual(third_as_kid["reason"], "seats_taken")
+        self.assertEqual(third_as_kid["taken"], [90])
+
+        # Neither refused attempt actually wrote a row.
+        self.assertIsNone(utils.get_guest_by_email("secondaspaid@test.com"))
+        self.assertIsNone(utils.get_guest_by_email("thirdaskid@test.com"))
+
+    def test_register_guest_capacity_counts_kid_seats(self):
+        """A free kid seat still occupies a real seat out of the venue's
+        cap — leaving it out of the cap check would let the venue be
+        oversold by exactly the number of free children registered."""
+        with patch.object(config, "max_total_tickets", return_value=5):
+            first = self._register(name="Family One", email="familyone@test.com",
+                                   zelle_ref="ZELLE-FAMILY01",
+                                   seat_numbers=[1, 2], kid_seat_numbers=[90, 91])
+            self.assertTrue(first["ok"])
+            # 4 of 5 seats are now spent (2 paid + 2 kid), even though
+            # ticket_count only shows 2 — tickets_sold() alone would say 2.
+            second = self._register(name="Family Two", email="familytwo@test.com",
+                                    zelle_ref="ZELLE-FAMILY02",
+                                    seat_numbers=[3], kid_seat_numbers=[92, 93])
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["reason"], "not_enough_tickets")
+        self.assertEqual(second["remaining"], 1)
+        self.assertIsNone(utils.get_guest_by_email("familytwo@test.com"))
+
+    def test_register_guest_kid_seats_default_to_none_unaffected(self):
+        """kid_seat_numbers left at its default (None): identical to the
+        pre-existing seat-picking behaviour, no kid columns involved."""
+        result = self._register(name="No Kids Default", email="nokidsdefault@test.com",
+                                zelle_ref="ZELLE-NOKIDDEF", seat_numbers=[5])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["guest"]["kid_seats"], [])
+        self.assertEqual(result["guest"]["kid_seat_numbers"], "")
+
+    def test_party_size_and_wristband_count_include_kids(self):
+        """A child still walks through the door and needs a wristband, and
+        counts toward the party's head count, even though they hold no
+        ticket."""
+        result = self._register(name="Party Size Family", email="partysizefam@test.com",
+                                zelle_ref="ZELLE-PARTYSZ1", plus_one_name=_guest_name(0),
+                                seat_numbers=[1, 2], kid_seat_numbers=[90, 91])
+        self.assertTrue(result["ok"])
+        guest = result["guest"]
+        # 2 paid tickets (registrant + 1 named guest) + 2 free kid seats.
+        self.assertEqual(utils.party_size(guest), 4)
+        self.assertEqual(utils.wristband_count(guest), 4)
+
+    def test_kid_seat_numbers_round_trips_through_the_db_and_to_dict(self):
+        session = get_db()
+        try:
+            guest = Guest(
+                name="Kid Round Trip", email="kidroundtrip@test.com", ticket_count=1,
+                zelle_ref="ZELLE-KIDRT001", qr_code=generate_qr_code(),
+                seat_numbers=utils.format_seat_numbers([1]),
+                kid_seat_numbers=utils.format_seat_numbers([91, 90]),
+            )
+            session.add(guest)
+            session.commit()
+            gid = guest.id
+        finally:
+            session.close()
+
+        reloaded = get_guest(gid)
+        self.assertEqual(reloaded["kid_seat_numbers"], "90,91")
+        self.assertEqual(reloaded["kid_seats"], [90, 91])
+
+    def test_generate_csv_includes_kid_seats_column(self):
+        session = get_db()
+        session.add(Guest(
+            name="Kid CSV Guest", email="kidcsv@test.com", ticket_count=1,
+            zelle_ref="ZELLE-KIDCSV1", qr_code=generate_qr_code(),
+            seat_numbers="1", kid_seat_numbers="91,90",
+        ))
+        session.commit()
+        session.close()
+
+        rows = list(csv.DictReader(io.StringIO(generate_csv())))
+        row = next(r for r in rows if r["Email"] == "kidcsv@test.com")
+        self.assertEqual(row["Kid Seats"], config.format_seat_labels([90, 91]))
+
+    def test_generate_csv_kid_seats_column_blank_for_no_kids(self):
+        session = get_db()
+        session.add(Guest(
+            name="No Kid CSV Guest", email="nokidcsv@test.com", ticket_count=1,
+            zelle_ref="ZELLE-NOKIDCSV", qr_code=generate_qr_code(),
+            seat_numbers="1",
+        ))
+        session.commit()
+        session.close()
+
+        rows = list(csv.DictReader(io.StringIO(generate_csv())))
+        row = next(r for r in rows if r["Email"] == "nokidcsv@test.com")
+        self.assertEqual(row["Kid Seats"], "—")
+
+    def test_kid_seat_numbers_list_delegates_to_seat_numbers_list(self):
+        self.assertEqual(utils.kid_seat_numbers_list("17,3,3,4"), [3, 4, 17])
+        self.assertEqual(utils.kid_seat_numbers_list(""), [])
+        self.assertEqual(utils.kid_seat_numbers_list(None), [])
+
+    def test_kid_tickets_sold_sums_kid_seats_across_bookings(self):
+        self._register(name="Kid Sold A", email="kidsolda@test.com",
+                       zelle_ref="ZELLE-KIDSOLDA", seat_numbers=[1], kid_seat_numbers=[90, 91])
+        self._register(name="Kid Sold B", email="kidsoldb@test.com",
+                       zelle_ref="ZELLE-KIDSOLDB", seat_numbers=[2], kid_seat_numbers=[92])
+        # A legacy/no-kids booking must contribute nothing.
+        self._register(name="Kid Sold C", email="kidsoldc@test.com",
+                       zelle_ref="ZELLE-KIDSOLDC", seat_numbers=[3])
+        self.assertEqual(utils.kid_tickets_sold(), 3)
+
+    def test_init_db_survives_a_raising_kid_seat_numbers_migration(self):
+        """Mirrors test_init_db_survives_a_raising_seat_numbers_migration:
+        the guests.kid_seat_numbers / submission_logs.kid_seat_numbers
+        ALTER TABLE migrations must be wrapped so a failure logs and
+        continues rather than aborting boot."""
+        from sqlalchemy import inspect as real_inspect_fn
+        from sqlalchemy.engine import Connection
+
+        class _FakeInspector:
+            def __init__(self, real):
+                self._real = real
+
+            def get_table_names(self):
+                return self._real.get_table_names()
+
+            def get_columns(self, table_name):
+                cols = self._real.get_columns(table_name)
+                if table_name in ("guests", "submission_logs"):
+                    cols = [c for c in cols if c["name"] != "kid_seat_numbers"]
+                return cols
+
+        def fake_inspect(engine_arg):
+            return _FakeInspector(real_inspect_fn(engine_arg))
+
+        original_execute = Connection.execute
+
+        def raising_execute(self_conn, statement, *args, **kwargs):
+            if "ADD COLUMN kid_seat_numbers" in str(statement):
+                raise RuntimeError("simulated ALTER TABLE failure")
+            return original_execute(self_conn, statement, *args, **kwargs)
+
+        with patch.object(utils, "inspect", side_effect=fake_inspect), \
+             patch.object(Connection, "execute", raising_execute):
+            try:
+                utils.init_db()
+            except Exception as e:
+                self.fail(f"init_db() raised despite the kid_seat_numbers migration being wrapped: {e}")
+
     # ── DB outage resilience (utils.db_health / degraded reads / writes still
     # report failure) ──────────────────────────────────────────────────────
     # Reproduces the "engine cached OK, database disappears later" incident:
