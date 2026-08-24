@@ -115,7 +115,33 @@ class Guest(Base):
     # it holds no specific seat we can name, but its ticket_count still
     # consumes real capacity (see taken_seats()/seat_availability()). Sized
     # for 512 chars, comfortably enough for a booking of all 100 seats.
+    #
+    # DEFINITION: these are PAID seats only. ticket_count == len(seat_numbers)
+    # for a seat-picking booking (see register_guest()), and this is the
+    # count additional_guests_expected()/guest-name validation is driven by.
+    # See kid_seat_numbers below for the FREE counterpart, which is
+    # deliberately excluded from all three.
     seat_numbers = Column(String(512), default="")
+    # Comma-joined, ascending FREE under-12 child seat numbers on this
+    # booking — same string format as seat_numbers (see
+    # utils.kid_seat_numbers_list()/format_seat_numbers()), but a SEPARATE
+    # column and a separate concept (see config.is_free_kid_seat() /
+    # AGENTS.md's kids-ticket rule):
+    #   * NOT a ticket — ticket_count and the guest-name requirement
+    #     (additional_guests_expected()) are driven by seat_numbers alone; a
+    #     child seat never requires a name.
+    #   * NOT revenue — a seat in here is $0 (see config.is_free_kid_seat());
+    #     _expected_revenue_cents() reads only Guest.seat_numbers.
+    #   * STILL a real occupied seat — taken_seats(), seat_availability(),
+    #     and register_guest()'s capacity check all count a kid seat exactly
+    #     like a paid one, because it is physically the same numbered chair.
+    #     A booking's total occupied seats = len(seat_numbers) +
+    #     len(kid_seat_numbers).
+    # Only seats in config.free_kid_seat_numbers() (the cheapest SEAT_TIERS
+    # entry) may appear here — enforced in validate_registration(). Blank
+    # ("") means no free child seats on this booking — the normal case, and
+    # every row that predates this feature.
+    kid_seat_numbers = Column(String(512), default="")
 
     def to_dict(self):
         return {
@@ -137,6 +163,12 @@ class Guest(Base):
             # Parsed form of seat_numbers, so UI code never has to split/parse
             # the raw comma string itself.
             "seats": seat_numbers_list(self.seat_numbers),
+            # FREE under-12 child seats — same raw/parsed pairing as
+            # seat_numbers/seats above, but a distinct set of seats (see the
+            # column comment on kid_seat_numbers). Not included in "seats"
+            # and not counted in ticket_count.
+            "kid_seat_numbers": self.kid_seat_numbers,
+            "kid_seats": kid_seat_numbers_list(self.kid_seat_numbers),
         }
 
 
@@ -188,6 +220,9 @@ class SubmissionLog(Base):
     # Recorded even on a failed attempt so organisers can see which seats a
     # guest was trying for when e.g. a seats_taken conflict turned them away.
     seat_numbers = Column(String(512), default="")
+    # FREE child seats the attempt asked for, comma-joined — see
+    # Guest.kid_seat_numbers. Same "recorded even on failure" rationale.
+    kid_seat_numbers = Column(String(512), default="")
 
 
 class AppSetting(Base):
@@ -566,6 +601,17 @@ def init_db():
                     conn.commit()
             except Exception as e:
                 print(f"Migration skipped: add guests.seat_numbers: {e}")
+        if "kid_seat_numbers" not in cols:
+            # Newest column, mirrors the seat_numbers wrapper immediately
+            # above for the same reason: a failure here must not be allowed
+            # to abort boot against the live database.
+            from sqlalchemy import text
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE guests ADD COLUMN kid_seat_numbers VARCHAR(512) DEFAULT ''"))
+                    conn.commit()
+            except Exception as e:
+                print(f"Migration skipped: add guests.kid_seat_numbers: {e}")
 
     # Migration for existing submission_logs tables that pre-date the meal
     # count columns — mirrors the guests-table blocks above.
@@ -593,6 +639,15 @@ def init_db():
                     conn.commit()
             except Exception as e:
                 print(f"Migration skipped: add submission_logs.seat_numbers: {e}")
+        if "kid_seat_numbers" not in sub_cols:
+            # Mirrors the guests.kid_seat_numbers wrapper above.
+            from sqlalchemy import text
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("ALTER TABLE submission_logs ADD COLUMN kid_seat_numbers VARCHAR(512) DEFAULT ''"))
+                    conn.commit()
+            except Exception as e:
+                print(f"Migration skipped: add submission_logs.kid_seat_numbers: {e}")
 
     # Widen plus_one_name to fit a full bulk guest-name list. The target width
     # is GUEST_NAMES_MAX_CHARS, derived from config.MAX_TICKETS_PER_REGISTRATION,
@@ -960,6 +1015,12 @@ def _expected_revenue_cents(session) -> int:
     throughout: this figure is meant to be reconciled against a Zelle
     history line by line, so it must not accumulate float error across a
     couple of hundred bookings.
+
+    Deliberately queries ONLY Guest.seat_numbers, never Guest.kid_seat_numbers
+    — free child seats (see config.is_free_kid_seat()) are $0 by design, so
+    they must NOT be added into this total. Do not "fix" this by folding
+    kid_seat_numbers into the sum below; that would charge the organiser's
+    own Zelle-reconciliation figure for seats that were never paid for.
     """
     total_cents = 0
     for ticket_count, seats_raw in session.query(Guest.ticket_count, Guest.seat_numbers):
@@ -1094,6 +1155,33 @@ def tickets_sold(session=None) -> int:
     session = session or get_db()
     try:
         return int(session.query(func.coalesce(func.sum(Guest.ticket_count), 0)).scalar() or 0)
+    finally:
+        if own_session:
+            session.close()
+
+
+def kid_tickets_sold(session=None) -> int:
+    """Return the total number of FREE child seats registered so far, across
+    every booking.
+
+    These are real occupied seats (config.is_free_kid_seat()) but are
+    deliberately NOT tickets and NOT counted in Guest.ticket_count — see the
+    Guest.kid_seat_numbers column comment — so they never show up in
+    tickets_sold()'s SUM(ticket_count). Any caller checking the venue's total
+    physical-seat cap (register_guest()'s in-transaction check) must add this
+    in separately, or the cap would only ever see paid seats and the venue
+    could be oversold by exactly the number of free children registered.
+
+    Pass an open `session` for the same in-transaction-authority reason as
+    tickets_sold().
+    """
+    own_session = session is None
+    session = session or get_db()
+    try:
+        total = 0
+        for (raw,) in session.query(Guest.kid_seat_numbers).all():
+            total += len(seat_numbers_list(raw))
+        return total
     finally:
         if own_session:
             session.close()
@@ -1494,6 +1582,7 @@ def record_submission(
     errors: str = "",
     guest_id: int = None,
     seat_numbers: str = "",
+    kid_seat_numbers: str = "",
 ) -> None:
     """Persist a registration submission attempt to Supabase/Postgres.
 
@@ -1502,6 +1591,9 @@ def record_submission(
     `seat_numbers` is the comma-joined string form (e.g. from
     validate_registration()'s cleaned["seat_numbers_str"]) so a failed
     seats_taken attempt still records which seats the guest was trying for.
+    `kid_seat_numbers` is the same string form for the FREE child seats
+    (cleaned["kid_seat_numbers_str"]); defaults to "" so existing callers
+    that don't pass it are unaffected.
     """
     session = None
     try:
@@ -1517,6 +1609,7 @@ def record_submission(
             errors=errors[:500],
             guest_id=guest_id,
             seat_numbers=(seat_numbers or "")[:512],
+            kid_seat_numbers=(kid_seat_numbers or "")[:512],
         )
         session.add(log)
         session.commit()
@@ -2260,6 +2353,9 @@ def generate_csv() -> str:
     The Seats column shows venue-style labels (config.format_seat_labels(),
     e.g. "A3, A4, B7") rather than the raw stored integers — this is a
     human-facing door list, and the DB/backup export keep the integer form.
+    The Kid Seats column is the same label format for the FREE under-12
+    child seats (Guest.kid_seat_numbers) — a separate list from Seats, since
+    those seats are free and not counted in Tickets.
     """
     session = get_db()
     try:
@@ -2267,7 +2363,7 @@ def generate_csv() -> str:
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow([
-            "Name", "Email", "Phone", "Tickets", "Seats", "Additional Guests",
+            "Name", "Email", "Phone", "Tickets", "Seats", "Kid Seats", "Additional Guests",
             "Additional Guest Names", "Zelle Ref",
             "Checked In", "Band Given", f"Check-in Time ({config.EVENT_TIMEZONE})", "QR Code"
         ])
@@ -2281,6 +2377,9 @@ def generate_csv() -> str:
                 # count — blank ("—") means a legacy row with no seats on
                 # file (see Guest.seat_numbers).
                 _sanitize_csv_field(config.format_seat_labels(seat_numbers_list(g.seat_numbers))) or "—",
+                # Blank ("—") here just means no free child seats on this
+                # booking — the normal case, not a legacy marker.
+                _sanitize_csv_field(config.format_seat_labels(kid_seat_numbers_list(g.kid_seat_numbers))) or "—",
                 guest_name_count(g.plus_one_name),
                 # Comma-joined, not raw: the names are stored newline-joined,
                 # and a cell with embedded newlines makes one guest's row
@@ -2689,8 +2788,25 @@ def additional_guests_expected(ticket_count) -> int:
     return max(tickets - 1, 0)
 
 
+def _kid_count(guest: dict) -> int:
+    """How many FREE child seats a guest dict carries.
+
+    Prefers the already-parsed "kid_seats" list (present on anything built
+    via Guest.to_dict()); falls back to parsing the raw "kid_seat_numbers"
+    string for a hand-built dict that only has the raw column. Missing
+    entirely (a dict from before this feature existed) is treated as 0
+    kids, never an error.
+    """
+    kids = guest.get("kid_seats")
+    if kids is None:
+        kids = kid_seat_numbers_list(guest.get("kid_seat_numbers", ""))
+    return len(kids)
+
+
 def party_size(guest: dict) -> int:
-    """Total head count for a booking: the registrant plus their named guests.
+    """Total head count for a booking: the registrant plus their named
+    guests, plus any FREE child seats (kids are not named, but they are
+    still people walking in the door — see Guest.kid_seat_numbers).
 
     Reads the names rather than trusting ticket_count, because rows that
     predate mandatory guest names (and rows hand-edited in the database) can
@@ -2702,7 +2818,8 @@ def party_size(guest: dict) -> int:
         tickets = int(guest.get("ticket_count") or 1)
     except (TypeError, ValueError):
         tickets = 1
-    return max(tickets, named + 1, 1)
+    paid_party = max(tickets, named + 1, 1)
+    return paid_party + _kid_count(guest)
 
 
 def sanitize_zelle_ref(ref: str) -> str:
@@ -2764,6 +2881,18 @@ def format_seat_numbers(seats) -> str:
     return ",".join(str(n) for n in sorted(cleaned))
 
 
+def kid_seat_numbers_list(value) -> list:
+    """Parse a stored Guest.kid_seat_numbers value into a sorted list of ints.
+
+    Identical stored format to Guest.seat_numbers (comma-joined ascending
+    integers), so this delegates straight to seat_numbers_list() rather than
+    duplicating its parsing/tolerance-of-garbage logic. Kept as its own name
+    so call sites (to_dict(), party_size(), wristband_count(), CSV export)
+    read as "kid seats", not a generic "seats" parse.
+    """
+    return seat_numbers_list(value)
+
+
 def parse_seat_selection(value) -> tuple:
     """Normalise arbitrary user input into validated seat numbers.
 
@@ -2817,9 +2946,16 @@ def parse_seat_selection(value) -> tuple:
 # and register_guest() can refuse a specific seat someone else just bought.
 
 def taken_seats(session=None) -> set:
-    """Return every seat number currently held by any guest row.
+    """Return every seat number currently held by any guest row — PAID
+    (Guest.seat_numbers) AND FREE CHILD (Guest.kid_seat_numbers) alike.
 
-    One query over Guest.seat_numbers, parsed in Python. Legacy rows
+    A free kid seat occupies a real numbered seat exactly the same as a paid
+    one (see config.is_free_kid_seat()), so it MUST be just as "taken" here.
+    This is the set register_guest() checks a new booking's seats against —
+    leaving kid seats out would let two bookings both claim seat 90 just
+    because one of them called it a kid's seat.
+
+    One query over both columns, parsed in Python. Legacy rows
     (seat_numbers == "") contribute no seat numbers here — we don't know
     which physical seats they hold — but they DO still consume capacity; see
     seat_availability() for how that's accounted for separately.
@@ -2851,8 +2987,9 @@ def taken_seats(session=None) -> set:
     session = session or get_db()
     try:
         taken = set()
-        for (raw,) in session.query(Guest.seat_numbers).all():
+        for raw, kid_raw in session.query(Guest.seat_numbers, Guest.kid_seat_numbers).all():
             taken.update(seat_numbers_list(raw))
+            taken.update(seat_numbers_list(kid_raw))
         return taken
     except Exception as e:
         if not own_session:
@@ -2903,7 +3040,11 @@ def seat_availability() -> dict:
     _legacy_ticket_count) — a legacy row consumed real capacity even though
     we can't say which seat, so leaving it out would let the venue be
     oversold by exactly that many seats. `legacy_tickets` reports that
-    number on its own so the admin/UI can surface it.
+    number on its own so the admin/UI can surface it. "taken" already
+    includes FREE child seats (taken_seats() reads both Guest.seat_numbers
+    and Guest.kid_seat_numbers), so a kid seat correctly shrinks `available`
+    and `remaining` exactly like a paid one — no separate accounting needed
+    here.
 
     Must never raise, but MUST distinguish "genuinely full" from "we cannot
     tell right now" — the two need opposite messages. Reporting a DB outage
@@ -2972,16 +3113,17 @@ def validate_registration(
     agree_terms: bool,
     ticket_count=1,
     seat_numbers=None,
+    kid_seat_numbers=None,
 ) -> tuple:
     """Validate and sanitize registration form fields.
 
     Returns (cleaned, errors): two dicts keyed by "name", "email", "phone",
     "ticket_count", "plus_one_name", "zelle_ref", "terms" (and
-    "seat_numbers" — see below). `cleaned` holds the sanitized value for
-    every field (empty string/False if invalid or not provided) plus
-    "additional_guest_count", the number of guests actually named. `errors`
-    holds a user-facing message only for fields that failed validation
-    (fields that passed are simply absent from `errors`).
+    "seat_numbers" / "kid_seat_numbers" — see below). `cleaned` holds the
+    sanitized value for every field (empty string/False if invalid or not
+    provided) plus "additional_guest_count", the number of guests actually
+    named. `errors` holds a user-facing message only for fields that failed
+    validation (fields that passed are simply absent from `errors`).
 
     `seat_numbers`, when passed (not None), makes seat-picking the authority
     for this booking instead of a plain quantity: it is run through
@@ -2997,6 +3139,28 @@ def validate_registration(
     `ticket_count` is validated as a plain quantity — so existing callers are
     unaffected.
 
+    `kid_seat_numbers`, when passed (not None), validates the FREE under-12
+    child seats on this booking — the organiser's rule (see AGENTS.md /
+    config.is_free_kid_seat()): a child may take a seat for free, but only
+    from the cheapest SEAT_TIERS tier; a front-row seat for a child is a
+    normal PAID seat added to `seat_numbers` instead. Parsed with the same
+    parse_seat_selection() used for `seat_numbers`. errors["kid_seat_numbers"]
+    is set (with a message naming the free-eligible range) if any parsed
+    seat is not config.is_free_kid_seat(), if a seat appears in both
+    `seat_numbers` and `kid_seat_numbers`, if more than
+    config.MAX_KIDS_PER_REGISTRATION are picked, or if kid seats are present
+    with no paid seat on the booking (a child cannot book alone — this
+    checks against `seat_numbers`' cleaned paid-seat list, so kid seats only
+    make sense on a seat-picking booking). An empty/blank pick is NOT an
+    error (a booking with no kids is normal). On success,
+    cleaned["kid_seat_numbers"] holds the normalised list of ints,
+    cleaned["kid_seat_numbers_str"] the comma-joined string form, and
+    cleaned["kid_count"] its length. Kid seats do NOT count toward
+    ticket_count, the guest-name requirement below, or revenue — see the
+    Guest.kid_seat_numbers column comment. Leaving `kid_seat_numbers` as None
+    (the default) adds none of these keys and behaves exactly as before this
+    parameter existed.
+
     Guest names are validated AGAINST the (possibly seat-derived) ticket
     count: a booking of N tickets is the registrant plus N-1 other people, so
     exactly N-1 additional names are required (see
@@ -3004,7 +3168,9 @@ def validate_registration(
     which meant a 6-ticket booking could arrive with nobody named — the
     organiser then had no idea who the other five people were, and the door
     had no list to check against. Requiring them here is the only point in
-    the flow where the guest is still present to answer.
+    the flow where the guest is still present to answer. Kid seats are
+    deliberately NOT named — the ticket count (and therefore the name
+    requirement) is driven only by `seat_numbers`.
 
     This replaces the validation that used to be duplicated twice in
     streamlit_app.page_register (once inside the st.form block, once after
@@ -3139,6 +3305,63 @@ def validate_registration(
     if seat_numbers is not None:
         cleaned["seat_numbers"] = seats_clean
         cleaned["seat_numbers_str"] = format_seat_numbers(seats_clean)
+
+    # Free under-12 child seats. Validated against the paid-seat list above
+    # (`seats_clean`, which is None unless `seat_numbers` was itself
+    # provided) — kid seats only make sense on a seat-picking booking, and a
+    # booking with no explicit paid seats is treated the same as "no paid
+    # seat" for the "child can't book alone" rule below.
+    kid_seats_clean = None
+    if kid_seat_numbers is not None:
+        parsed_kids, kid_reason = parse_seat_selection(kid_seat_numbers)
+        paid_seats_for_check = seats_clean or []
+        range_label = config.free_kid_seat_range_label()
+
+        if kid_reason == "invalid":
+            errors["kid_seat_numbers"] = "Please select valid seat numbers for the free child seats."
+        elif kid_reason == "out_of_range":
+            errors["kid_seat_numbers"] = f"Seats must be between 1 and {config.TOTAL_SEATS}."
+        else:
+            non_free = [s for s in parsed_kids if not config.is_free_kid_seat(s)]
+            overlap = sorted(set(parsed_kids) & set(paid_seats_for_check))
+            if non_free:
+                # This message is the whole point of the feature: say
+                # exactly where a free child seat IS allowed, and what to
+                # do instead if the family wants a front-row seat.
+                plural = len(non_free) != 1
+                errors["kid_seat_numbers"] = (
+                    f"Seat{'s' if plural else ''} {config.format_seat_labels(non_free)} "
+                    f"{'are' if plural else 'is'} outside the free child-seat range. Kids under "
+                    f"12 ride free only in seats {range_label} (our cheapest tier) — if you'd "
+                    "like a front-row seat for your child instead, add it as a regular paid "
+                    "seat above."
+                )
+            elif overlap:
+                plural = len(overlap) != 1
+                errors["kid_seat_numbers"] = (
+                    f"Seat{'s' if plural else ''} {config.format_seat_labels(overlap)} "
+                    f"{'are' if plural else 'is'} already selected as a paid seat. A seat can't "
+                    "be booked as both — pick a different seat for the free child seat."
+                )
+            elif len(parsed_kids) > config.MAX_KIDS_PER_REGISTRATION:
+                errors["kid_seat_numbers"] = (
+                    f"That's more than {config.MAX_KIDS_PER_REGISTRATION} free child seats — "
+                    f"please select at most {config.MAX_KIDS_PER_REGISTRATION}."
+                )
+            elif parsed_kids and not paid_seats_for_check:
+                errors["kid_seat_numbers"] = (
+                    "A child can't book alone — add at least one paid adult seat to this "
+                    "booking before adding a free child seat."
+                )
+            else:
+                kid_seats_clean = parsed_kids
+
+        if kid_seats_clean is None:
+            kid_seats_clean = []
+        cleaned["kid_seat_numbers"] = kid_seats_clean
+        cleaned["kid_seat_numbers_str"] = format_seat_numbers(kid_seats_clean)
+        cleaned["kid_count"] = len(kid_seats_clean)
+
     return cleaned, errors
 
 
@@ -3150,6 +3373,7 @@ def register_guest(
     plus_one_name: str,
     zelle_ref: str,
     seat_numbers=None,
+    kid_seat_numbers=None,
 ) -> dict:
     """Create a new guest registration.
 
@@ -3162,18 +3386,30 @@ def register_guest(
     "not_enough_tickets"|"db_error"|"db_unavailable", "message": str}. The
     two ticket-capacity refusals also carry "remaining" (tickets still
     available); "seats_taken" carries "taken" (the specific conflicting seat
-    numbers) so the caller can show the guest exactly what to re-pick.
+    numbers, paid or kid) so the caller can show the guest exactly what to
+    re-pick.
 
     `seat_numbers`, when given (not None), makes this a seat-picking
     booking: it should already be the normalised list validate_registration()
     produced (cleaned["seat_numbers"]). The booking's ticket_count becomes
     len(seat_numbers) — the `ticket_count` argument is ignored — and the
-    seats are persisted via format_seat_numbers(). Crucially, the taken-seats
-    check here happens INSIDE this function's transaction, behind the same
-    _lock_ticket_capacity() advisory lock as the ticket-cap check below: the
-    Register page's availability read is a cached, seconds-stale snapshot,
-    so this in-transaction re-check is the only thing that can actually stop
-    two guests from both claiming the same seat.
+    seats are persisted via format_seat_numbers().
+
+    `kid_seat_numbers`, when given (not None), should be the normalised list
+    validate_registration() produced (cleaned["kid_seat_numbers"]) — the FREE
+    under-12 child seats on this booking (see config.is_free_kid_seat()).
+    These are persisted separately (Guest.kid_seat_numbers) and do NOT add to
+    ticket_count — they are not tickets and not revenue — but they DO consume
+    real seat inventory exactly like a paid seat: this booking occupies
+    len(seat_numbers) + len(kid_seat_numbers) physical seats total, and both
+    the taken-seats re-check and the ticket-cap check below count both.
+
+    Crucially, the taken-seats check here happens INSIDE this function's
+    transaction, behind the same _lock_ticket_capacity() advisory lock as the
+    ticket-cap check below: the Register page's availability read is a
+    cached, seconds-stale snapshot, so this in-transaction re-check is the
+    only thing that can actually stop two guests from both claiming the same
+    seat — paid or kid.
     """
     # Refuse to write into the throwaway SQLite fallback: a registration
     # accepted there looks successful, emails a QR code, and then vanishes
@@ -3189,6 +3425,17 @@ def register_guest(
         requested = len(seats_clean)
     else:
         requested = int(ticket_count) if ticket_count else 1
+
+    kid_seats_clean = []
+    kid_seats_str = ""
+    if kid_seat_numbers is not None:
+        kid_seats_str = format_seat_numbers(kid_seat_numbers)
+        kid_seats_clean = seat_numbers_list(kid_seats_str)
+
+    # Total physical seats this booking occupies: paid + free kid seats.
+    # Both draw from the same finite pool of numbered seats, so both must
+    # count against the venue's cap below — see config.is_free_kid_seat().
+    total_seats_requested = requested + len(kid_seats_clean)
 
     session = None
     try:
@@ -3208,11 +3455,12 @@ def register_guest(
         # the insert (and behind the advisory lock, so simultaneous submits
         # can't both spend the last seat).
         cap = config.max_total_tickets()
-        if cap > 0 or seats_clean is not None:
+        if cap > 0 or seats_clean is not None or kid_seats_clean:
             _lock_ticket_capacity(session)
 
-        if seats_clean is not None:
-            conflict = sorted(set(seats_clean) & taken_seats(session))
+        if seats_clean is not None or kid_seats_clean:
+            requested_seats = set(seats_clean or []) | set(kid_seats_clean)
+            conflict = sorted(requested_seats & taken_seats(session))
             if conflict:
                 return {
                     "ok": False,
@@ -3222,14 +3470,22 @@ def register_guest(
                 }
 
         if cap > 0:
-            remaining = max(0, cap - tickets_sold(session))
+            # tickets_sold() sums Guest.ticket_count, which is PAID seats
+            # only (kid seats are deliberately excluded from ticket_count —
+            # see the Guest.kid_seat_numbers column comment). kid_tickets_sold()
+            # adds back every free child seat already registered so the cap
+            # is checked against TOTAL occupied seats, not just paid ones —
+            # otherwise the venue could be oversold by exactly the number of
+            # free children registered.
+            already_sold = tickets_sold(session) + kid_tickets_sold(session)
+            remaining = max(0, cap - already_sold)
             if remaining <= 0:
                 return {"ok": False, "reason": "sold_out", "message": SOLD_OUT_MESSAGE, "remaining": 0}
-            if requested > remaining:
+            if total_seats_requested > remaining:
                 return {
                     "ok": False,
                     "reason": "not_enough_tickets",
-                    "message": _not_enough_tickets_message(requested, remaining),
+                    "message": _not_enough_tickets_message(total_seats_requested, remaining),
                     "remaining": remaining,
                 }
 
@@ -3242,6 +3498,7 @@ def register_guest(
             zelle_ref=zelle_ref,
             qr_code=generate_qr_code(),
             seat_numbers=seats_str,
+            kid_seat_numbers=kid_seats_str,
         )
         session.add(guest)
         session.commit()
@@ -3356,17 +3613,21 @@ def find_guest_by_code(code: str) -> dict:
 
 
 def wristband_count(guest: dict) -> int:
-    """How many wristbands this booking is owed — one per ticket.
+    """How many wristbands this booking is owed — one per ticket, plus one
+    per FREE child seat (see Guest.kid_seat_numbers). A child who takes a
+    free cheap-tier seat still walks through the door and needs a band, even
+    though they hold no ticket and paid nothing.
 
-    Named rather than inlined because "bands" and "tickets" are the same
-    number for a reason (a booking of 4 tickets walks in as 4 people) and
-    the door staff card states it explicitly; if that ever stops being
-    one-to-one, this is the single place it changes.
+    Named rather than inlined because "bands" and "tickets" used to be the
+    same number for a reason (a booking of 4 tickets walks in as 4 people);
+    now it's tickets + kids, and this is the single place that changes if
+    the relationship changes again.
     """
     try:
-        return max(int(guest.get("ticket_count") or 1), 1)
+        tickets = max(int(guest.get("ticket_count") or 1), 1)
     except (TypeError, ValueError):
-        return 1
+        tickets = 1
+    return tickets + _kid_count(guest)
 
 
 def check_in_by_code(code: str, bypass_window: bool = False) -> dict:
@@ -3886,7 +4147,7 @@ _BACKUP_SPECS = (
         Guest,
         ("id", "name", "email", "phone", "ticket_count", "plus_one_name",
          "zelle_ref", "qr_code", "checked_in", "band_given", "checkin_time", "created_at",
-         "veg_count", "non_veg_count", "seat_numbers"),
+         "veg_count", "non_veg_count", "seat_numbers", "kid_seat_numbers"),
         "id",
         "One row per registration — contact details, tickets, QR code, check-in state.",
     ),
@@ -3909,7 +4170,7 @@ _BACKUP_SPECS = (
         SubmissionLog,
         ("id", "name", "email", "phone", "ticket_count", "plus_one_name",
          "zelle_ref", "status", "errors", "guest_id", "created_at",
-         "veg_count", "non_veg_count", "seat_numbers"),
+         "veg_count", "non_veg_count", "seat_numbers", "kid_seat_numbers"),
         "id",
         "Every registration attempt — successful or not — with its failure reason.",
     ),

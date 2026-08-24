@@ -223,6 +223,47 @@ class TestConfig(unittest.TestCase):
                 "to the base price",
             )
 
+    # ── Free kid seats: FREE_KID_TIER / free_kid_seat_numbers / is_free_kid_seat /
+    # free_kid_seat_range_label — the organiser's "kids free, cheapest tier only" rule ──
+
+    def test_free_kid_tier_is_the_cheapest_seat_tier(self):
+        with patch.object(config, "SEAT_TIERS", ((1, 25, 5000), (26, 75, 2500), (76, 100, 1000))):
+            self.assertEqual(config._free_kid_tier(), (76, 100, 1000))
+
+    def test_free_kid_tier_picks_lowest_price_regardless_of_tuple_order(self):
+        """Must derive from the PRICE, not from being the last/highest-numbered
+        tier — a re-ordered or re-priced SEAT_TIERS must not silently point
+        the free range at the wrong seats."""
+        with patch.object(config, "SEAT_TIERS", ((76, 100, 1000), (1, 25, 5000), (26, 75, 2500))):
+            self.assertEqual(config._free_kid_tier(), (76, 100, 1000))
+
+    def test_free_kid_seat_numbers_spans_the_cheapest_tier(self):
+        with patch.object(config, "SEAT_TIERS", ((1, 25, 5000), (26, 75, 2500), (76, 100, 1000))):
+            self.assertEqual(config.free_kid_seat_numbers(), list(range(76, 101)))
+
+    def test_free_kid_seat_numbers_empty_when_seat_tiers_empty(self):
+        with patch.object(config, "SEAT_TIERS", ()):
+            self.assertEqual(config.free_kid_seat_numbers(), [])
+
+    def test_is_free_kid_seat_true_only_within_the_cheapest_tier(self):
+        with patch.object(config, "SEAT_TIERS", ((1, 25, 5000), (26, 75, 2500), (76, 100, 1000))):
+            self.assertTrue(config.is_free_kid_seat(76))
+            self.assertTrue(config.is_free_kid_seat(90))
+            self.assertTrue(config.is_free_kid_seat(100))
+            self.assertFalse(config.is_free_kid_seat(1))
+            self.assertFalse(config.is_free_kid_seat(75))
+
+    def test_is_free_kid_seat_never_raises_on_garbage(self):
+        self.assertFalse(config.is_free_kid_seat("not-a-seat"))
+        self.assertFalse(config.is_free_kid_seat(None))
+
+    def test_free_kid_seat_range_label_uses_seat_label_format(self):
+        with patch.object(config, "SEAT_TIERS", ((1, 25, 5000), (26, 75, 2500), (76, 100, 1000))):
+            self.assertEqual(config.free_kid_seat_range_label(), "H6–J10")
+
+    def test_max_kids_per_registration_reuses_max_tickets_per_registration(self):
+        self.assertEqual(config.MAX_KIDS_PER_REGISTRATION, config.MAX_TICKETS_PER_REGISTRATION)
+
     # ── Seat labels: seat_label / seat_from_label / format_seat_labels ─────
 
     def test_seat_label_first_seat_of_the_grid(self):
@@ -335,13 +376,31 @@ class TestConfig(unittest.TestCase):
 
     def test_kids_and_food_policy_text_state_the_two_facts(self):
         """theme.seat_policy_chips() reads these verbatim, so the facts
-        themselves have to live here — and must not overreach into the
-        still-open question of whether a free child holds a reserved seat."""
+        themselves have to live here. The organiser's rule (AGENTS.md): a
+        child under 12 rides free, but only in the cheapest SEAT_TIERS
+        range — a front-row seat is a normal paid seat. KIDS_POLICY_TEXT
+        must name that range (via free_kid_seat_range_label()) rather than
+        just saying "kids are free" and leaving the seat question open."""
         self.assertIn("free", config.KIDS_POLICY_TEXT.lower())
         self.assertIn("12", config.KIDS_POLICY_TEXT)
-        self.assertNotIn("seat", config.KIDS_POLICY_TEXT.lower())
+        self.assertIn("seat", config.KIDS_POLICY_TEXT.lower())
+        self.assertIn(config.free_kid_seat_range_label(), config.KIDS_POLICY_TEXT)
+        self.assertIn("paid", config.KIDS_POLICY_TEXT.lower())
         self.assertIn("purchase", config.FOOD_POLICY_TEXT.lower())
         self.assertIn("venue", config.FOOD_POLICY_TEXT.lower())
+
+    def test_kids_policy_text_tracks_seat_tiers_not_hardcoded(self):
+        """The free-child range named in KIDS_POLICY_TEXT must come from
+        free_kid_seat_range_label() (derived from SEAT_TIERS), not a
+        hardcoded "76-100"/"H6-J10" string that could drift from the real
+        pricing table."""
+        self.assertEqual(
+            config.KIDS_POLICY_TEXT,
+            (
+                f"Kids under 12 ride free — but only in seats {config.free_kid_seat_range_label()}, "
+                "our cheapest tier. A front-row seat for a child is a regular paid seat."
+            ),
+        )
 
     # ── Check-in window: event_start_utc / checkin_opens_at_utc ────────────
 

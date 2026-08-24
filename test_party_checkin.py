@@ -183,10 +183,10 @@ class TestPartyCheckIn(unittest.TestCase):
 
     def _register(self, name="Reg Guest", email="reg@test.com", phone="",
                    ticket_count=1, plus_one_name="", zelle_ref="ZELLE-DEFAULT01",
-                   seat_numbers=None):
+                   seat_numbers=None, kid_seat_numbers=None):
         """Helper: create a guest via the service layer (returns the result dict)."""
         return register_guest(name, email, phone, ticket_count, plus_one_name, zelle_ref,
-                               seat_numbers=seat_numbers)
+                               seat_numbers=seat_numbers, kid_seat_numbers=kid_seat_numbers)
 
     # ── Database Tests ──────────────────────────────────────────────────────
     

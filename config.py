@@ -102,10 +102,15 @@ VENUE_HOUSE_RULE_TEXT = "The building must be cleared by 10:00 PM."
 # Two facts a guest choosing seats must not miss — surfaced as their own
 # chips next to the seat picker (see theme.seat_policy_chips()) rather than
 # buried in a paragraph, per the same "one home for event copy" rule as the
-# VENUE_* text above. Deliberately limited to just these two stated facts:
-# whether a free child holds their own reserved seat is still an open
-# question for the organiser, so this copy does not answer it either way.
-KIDS_POLICY_TEXT = "Kids under age 12 are free."
+# VENUE_* text above.
+#
+# FOOD_POLICY_TEXT lives here. KIDS_POLICY_TEXT is defined further down (see
+# free_kid_seat_range_label(), near the seat-tier helpers) because it now
+# NAMES the free-child seat range, which means it can't be built until
+# SEAT_TIERS/seat_label() exist — the organiser's rule is no longer just
+# "kids are free" (an open question this copy used to duck), it's "kids are
+# free, but only in the cheapest tier; a front-row seat is bought like any
+# other seat" — see is_free_kid_seat()/free_kid_seat_numbers() below.
 FOOD_POLICY_TEXT = "Vegetarian food is available for purchase at the venue."
 
 APP_VERSION = "1.0-generic"
@@ -566,6 +571,85 @@ def format_seat_labels(seats) -> str:
     return ", ".join(seat_label(n) for n in sorted(cleaned))
 
 
+# ── Free kid seats ───────────────────────────────────────────────────────────
+# The organiser's rule, verbatim: "kids tickets will be free but only allow
+# to select $10 seats only for free.. if they want to sit in front rows then
+# they can purchase if needed." So a child under 12 may take a seat for FREE,
+# but only from the CHEAPEST SEAT_TIERS entry; a front-row seat for a child
+# is simply a normal PAID seat — there is no separate discounted price.
+#
+# Derived from SEAT_TIERS (never hardcoded as "76-100") so the free-eligible
+# range tracks the pricing table if it is ever edited.
+
+def _free_kid_tier():
+    """The lowest-priced SEAT_TIERS entry, or None if SEAT_TIERS is empty.
+
+    Recomputed from the CURRENT module-level SEAT_TIERS on every call (unlike
+    the FREE_KID_TIER constant below, a one-time snapshot taken at import —
+    same relationship TOTAL_SEATS has to a SEAT_TIERS patched later in a
+    test). The public functions below all call this, not the snapshot, so a
+    live-patched SEAT_TIERS is honoured immediately.
+    """
+    if not SEAT_TIERS:
+        return None
+    return min(SEAT_TIERS, key=lambda tier: tier[2])
+
+
+# Snapshot of the cheapest seat tier at import time, for convenient direct
+# access/display. See _free_kid_tier()'s docstring for why the functions
+# below recompute rather than read this.
+FREE_KID_TIER = _free_kid_tier()
+
+
+def free_kid_seat_numbers() -> list:
+    """Every seat number a FREE child seat may occupy: every seat in the
+    cheapest SEAT_TIERS entry. Empty list if SEAT_TIERS is empty."""
+    tier = _free_kid_tier()
+    if tier is None:
+        return []
+    start, end, _price = tier
+    return list(range(start, end + 1))
+
+
+def is_free_kid_seat(seat_number) -> bool:
+    """True if `seat_number` is one of the free-kid-eligible cheap seats.
+
+    Must never raise: a garbage/non-numeric input returns False, matching
+    seat_price_cents()'s defensive style.
+    """
+    try:
+        n = int(seat_number)
+    except (TypeError, ValueError):
+        return False
+    tier = _free_kid_tier()
+    if tier is None:
+        return False
+    start, end, _price = tier
+    return start <= n <= end
+
+
+def free_kid_seat_range_label() -> str:
+    """Human, venue-style label for the free-kid-eligible seat range, e.g.
+    "H6–J10" (config.seat_label() form) — for UI copy (KIDS_POLICY_TEXT, the
+    kid-seat validation error) rather than exposing raw seat-number bounds.
+    Empty string if SEAT_TIERS is empty.
+    """
+    seats = free_kid_seat_numbers()
+    if not seats:
+        return ""
+    return f"{seat_label(seats[0])}–{seat_label(seats[-1])}"
+
+
+# The organiser's rule in one chip-sized sentence: WHERE a free child seat
+# may be taken (named explicitly, not just "the cheapest tier"), and that a
+# front-row seat is bought like any other seat. See the FOOD_POLICY_TEXT
+# comment above for why this lives here rather than next to it.
+KIDS_POLICY_TEXT = (
+    f"Kids under 12 ride free — but only in seats {free_kid_seat_range_label()}, "
+    "our cheapest tier. A front-row seat for a child is a regular paid seat."
+)
+
+
 def seats_total_cents(seats) -> int:
     """Total price in cents for a specific, possibly non-contiguous set of
     seat numbers, e.g. [1, 30, 80] -> seat_price_cents(1) + seat_price_cents(30)
@@ -658,6 +742,19 @@ def max_total_tickets() -> int:
 # derived from that, so the storage grows with the cap instead of silently
 # truncating the tail of a big booking's guest list.
 MAX_TICKETS_PER_REGISTRATION = 100
+
+
+# Most FREE child seats one registration may claim. Reuses
+# MAX_TICKETS_PER_REGISTRATION rather than introducing a second constant: a
+# kid seat is real seat inventory exactly like a paid one (see
+# is_free_kid_seat()), so the same "how many seats can one registration
+# claim" ceiling that already governs seat_numbers applies here too — there
+# is no reason one registration should be allowed a different number of kid
+# seats than paid ones. The actual backstop against one registration
+# draining the whole free tier is the tier's own size
+# (len(free_kid_seat_numbers()), currently 25) plus live seat availability,
+# not a second arbitrary number to keep in sync with this one.
+MAX_KIDS_PER_REGISTRATION = MAX_TICKETS_PER_REGISTRATION
 
 
 _DEFAULT_ZELLE = "dfwygana@gmail.com"

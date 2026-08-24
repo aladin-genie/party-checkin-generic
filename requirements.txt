@@ -1,6 +1,13 @@
 # Runtime dependencies for Streamlit Community Cloud.
 # Pinned to the versions the live deployment is verified against.
 # Target Python: 3.12 (set under Streamlit Cloud → Advanced settings).
+#
+# IMPORTANT: These pinned versions have pre-built wheels for Python 3.12.
+# If Streamlit Cloud builds with Python 3.13/3.14, packages such as
+# psycopg2-binary, pandas, Pillow, opencv-python-headless and numpy must
+# compile from source (and psycopg2 needs pg_config), which causes the
+# deployment to hang or fail with "Error installing requirements".
+# Keep the Cloud runtime at Python 3.12.
 
 streamlit==1.40.0
 altair==5.5.0          # st.bar_chart renders through altair; streamlit 1.40 requires <6
