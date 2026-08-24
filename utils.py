@@ -929,6 +929,15 @@ def ticket_availability() -> dict:
     stays open) rather than wrongly telling guests the party is sold out.
     register_guest() re-checks the real number inside its transaction, so
     failing open here cannot oversell anything.
+
+    Kept deliberately in agreement with seat_availability(): both report
+    `sold_out=False` on a DB failure, so the two pictures can never disagree
+    about whether the event is sold out during an outage. `unlimited=True`
+    here makes theme.tickets_remaining() render nothing at all (rather than
+    a misleading "0 remaining"); seat_availability() instead surfaces an
+    explicit `unavailable=True` for its own caller, since the Register page
+    needs to actively tell the guest we can't check right now rather than
+    just going quiet.
     """
     cap = 0
     try:
@@ -2596,8 +2605,22 @@ def taken_seats(session=None) -> set:
     connection sees every seat committed by another booking under
     READ COMMITTED, even mid-transaction.
 
-    Must never raise: returns an empty set and prints a diagnostic if the DB
-    is unavailable, matching how ticket_availability() degrades today.
+    Error handling deliberately SPLITS on whether a session was passed in:
+      - `session=None` (the standalone display path, e.g. seat_availability()):
+        never raises — a DB blip degrades to an empty set and prints a
+        diagnostic, matching how ticket_availability() degrades today. Wrong
+        seats shown here are cosmetic; register_guest()'s in-transaction
+        re-check is what actually protects against overselling.
+      - `session=<open session>` (the authoritative re-check inside
+        register_guest(), behind _lock_ticket_capacity()'s advisory lock):
+        exceptions PROPAGATE, uncaught. This is the ONLY thing standing
+        between two simultaneous bookings and both claiming the same seat —
+        if the SELECT here failed and we swallowed it into an empty set,
+        register_guest() would conclude no seat is taken and happily
+        double-book. register_guest() already wraps its whole transaction in
+        a broad `except Exception` that rolls back and returns a clean
+        `reason: "db_error"` failure, so letting this raise there produces a
+        normal failed-registration response, not a crash.
     """
     own_session = session is None
     session = session or get_db()
@@ -2607,6 +2630,8 @@ def taken_seats(session=None) -> set:
             taken.update(seat_numbers_list(raw))
         return taken
     except Exception as e:
+        if not own_session:
+            raise
         print(f"utils.taken_seats unavailable, treating as no seats taken: {e}")
         return set()
     finally:
@@ -2646,7 +2671,7 @@ def seat_availability() -> dict:
     """Return the current seat-inventory picture for the UI.
 
     {"taken": set, "available": [...], "total": TOTAL_SEATS, "remaining": int,
-    "sold_out": bool, "legacy_tickets": int}.
+    "sold_out": bool, "legacy_tickets": int, "unavailable": bool}.
 
     `remaining` subtracts BOTH the explicitly-taken seats AND the
     ticket_count of every legacy row with no seat_numbers recorded (see
@@ -2655,10 +2680,19 @@ def seat_availability() -> dict:
     oversold by exactly that many seats. `legacy_tickets` reports that
     number on its own so the admin/UI can surface it.
 
-    Must never raise: a DB blip degrades to reporting no seats available
-    (sold_out) rather than wrongly telling guests seats they can't actually
-    have are free — register_guest()'s in-transaction re-check is what
-    actually prevents a double-booking, not this display read.
+    Must never raise, but MUST distinguish "genuinely full" from "we cannot
+    tell right now" — the two need opposite messages. Reporting a DB outage
+    as `sold_out` once told every visitor to a live event "sold out — every
+    ticket is claimed" during a transient Supabase blip, which is strictly
+    worse than the truth: a guest who leaves because the party looks full
+    doesn't come back, but a guest asked to try again in a few minutes will.
+    So on failure this returns `sold_out=False` and `unavailable=True`
+    instead — explicitly NOT full, but explicitly not bookable either — and
+    the caller must render neither the sold-out screen nor the seat picker
+    for that combination (see theme.seats_unavailable_notice()).
+    register_guest()'s in-transaction re-check (via taken_seats(session=...),
+    which propagates rather than swallows a DB error) is what actually
+    prevents a double-booking, not this display read.
     """
     total = config.TOTAL_SEATS
     try:
@@ -2673,12 +2707,13 @@ def seat_availability() -> dict:
             "remaining": remaining,
             "sold_out": remaining <= 0,
             "legacy_tickets": legacy_tickets,
+            "unavailable": False,
         }
     except Exception as e:
-        print(f"utils.seat_availability unavailable, treating as sold out: {e}")
+        print(f"utils.seat_availability unavailable, cannot tell if sold out: {e}")
         return {
             "taken": set(), "available": [], "total": total, "remaining": 0,
-            "sold_out": True, "legacy_tickets": 0,
+            "sold_out": False, "legacy_tickets": 0, "unavailable": True,
         }
 
 

@@ -320,6 +320,14 @@ def page_home():
         # space. Mirrors the admin dashboard's own hero-tile pairing
         # (Checked In / Total Guests).
         seat_avail = _cached_seat_availability()
+        # A DB blip must not paint "0 of N" here — that reads exactly like
+        # the event being full. Show a dash instead when we genuinely don't
+        # know (see utils.seat_availability()'s unavailable flag).
+        if seat_avail["unavailable"]:
+            seats_value, seats_caption = "—", "temporarily unavailable"
+        else:
+            seats_value = seat_avail["remaining"]
+            seats_caption = f"of {seat_avail['total']} total"
         st.markdown(
             theme.stat_tiles(
                 [
@@ -329,8 +337,8 @@ def page_home():
                         "accent": "gold", "emphasis": "hero",
                     },
                     {
-                        "label": "Seats Remaining", "value": seat_avail["remaining"],
-                        "caption": f"of {seat_avail['total']} total", "icon": "💺",
+                        "label": "Seats Remaining", "value": seats_value,
+                        "caption": seats_caption, "icon": "💺",
                         "accent": "turquoise", "emphasis": "hero",
                     },
                 ]
@@ -546,6 +554,16 @@ def page_register():
     # real, individually-numbered inventory now (see config.SEAT_TIERS), so
     # this is the authoritative "is there anything left to sell" read.
     seat_avail = _cached_seat_availability()
+    if seat_avail["unavailable"]:
+        # The DB read behind seat inventory failed — we genuinely don't know
+        # which seats are free. Must be checked BEFORE sold_out: on this
+        # failure seat_avail["sold_out"] is deliberately False (see
+        # utils.seat_availability()), but there's still nothing safe to sell
+        # here, so don't fall through to the seat picker/form either.
+        st.markdown(theme.stepper(1), unsafe_allow_html=True)
+        st.markdown(theme.seats_unavailable_notice(), unsafe_allow_html=True)
+        _home_button(key="home_seats_unavailable")
+        return
     if seat_avail["sold_out"]:
         st.markdown(theme.stepper(1), unsafe_allow_html=True)
         st.markdown(theme.sold_out_notice(utils.SOLD_OUT_MESSAGE), unsafe_allow_html=True)

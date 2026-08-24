@@ -3277,6 +3277,61 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(availability["remaining"], config.TOTAL_SEATS - 2 - 5)
         self.assertFalse(availability["sold_out"])
 
+    def test_seat_availability_reports_unavailable_not_sold_out_on_db_outage(self):
+        """Regression test: a live outage once made seat_availability() report
+        sold_out=True to every visitor, which told every prospective guest
+        the event was sold out during a transient Supabase blip. On a DB
+        failure it must report unavailable=True and sold_out=False instead —
+        those two states need opposite messages on the Register page."""
+        with patch.object(utils, "taken_seats", side_effect=RuntimeError("db down")):
+            availability = utils.seat_availability()
+        self.assertTrue(availability["unavailable"])
+        self.assertFalse(availability["sold_out"])
+        self.assertEqual(availability["remaining"], 0)
+        self.assertEqual(availability["taken"], set())
+        self.assertEqual(availability["available"], [])
+
+    def test_seat_availability_genuinely_full_house_is_sold_out_not_unavailable(self):
+        """The opposite failure mode must not regress either: a real
+        sell-out still reports sold_out=True, unavailable=False."""
+        # TOTAL_SEATS == MAX_TICKETS_PER_REGISTRATION (both 100 by default),
+        # so every seat can be claimed in one booking.
+        self._register(name="Full House", email="fullhouse@test.com",
+                       zelle_ref="ZELLE-FULLHS01", seat_numbers=config.all_seat_numbers())
+        availability = utils.seat_availability()
+        self.assertTrue(availability["sold_out"])
+        self.assertFalse(availability["unavailable"])
+        self.assertEqual(availability["remaining"], 0)
+
+    def test_taken_seats_propagates_db_error_with_session_but_degrades_without(self):
+        """The two callers of taken_seats() need opposite failure behaviour:
+        the standalone display read (no session) must degrade to an empty
+        set, but the authoritative in-transaction re-check inside
+        register_guest() (session passed) must PROPAGATE a DB error rather
+        than silently reporting no seats taken — a swallowed error there
+        would let register_guest() double-book a seat someone else already
+        holds."""
+        session = get_db()
+        try:
+            with patch.object(session, "query", side_effect=RuntimeError("db down")):
+                with self.assertRaises(RuntimeError):
+                    utils.taken_seats(session=session)
+        finally:
+            session.close()
+
+        # Standalone path (own session, opened internally): the failure must
+        # still surface from the query, not from acquiring the connection
+        # itself, so patch what taken_seats() calls once it has its session.
+        class _RaisingQuerySession:
+            def query(self, *args, **kwargs):
+                raise RuntimeError("db down")
+
+            def close(self):
+                pass
+
+        with patch.object(utils, "get_db", return_value=_RaisingQuerySession()):
+            self.assertEqual(utils.taken_seats(), set())
+
     # ── Seats: register_guest / validate_registration seat-picking path ────
 
     def test_register_guest_can_book_only_cheap_seats(self):
@@ -3306,6 +3361,23 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(config.seat_label(21), "C1")
         # The conflicting registration must not have been written at all.
         self.assertIsNone(utils.get_guest_by_email("secondpicker@test.com"))
+
+    def test_register_guest_fails_cleanly_when_the_seat_recheck_raises(self):
+        """If the authoritative in-transaction taken_seats(session=...)
+        re-check hits a DB error, register_guest() must surface a clean
+        ok=False/"db_error" failure — not a traceback, and absolutely not a
+        double-booking (an empty-set fallback here would let this booking
+        through even though we never actually confirmed the seat was
+        free)."""
+        with patch.object(utils, "taken_seats", side_effect=RuntimeError("db down mid-transaction")):
+            result = self._register(name="Unlucky Picker", email="unluckypicker@test.com",
+                                    zelle_ref="ZELLE-UNLUCKY1", seat_numbers=[40, 41])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "db_error")
+        # No guest row, no seats — the failed re-check must not have let a
+        # write through.
+        self.assertIsNone(utils.get_guest_by_email("unluckypicker@test.com"))
+        self.assertEqual(utils.taken_seats(), set())
 
     def test_validate_registration_derives_ticket_count_from_seats_and_enforces_names(self):
         # 3 seats needs 2 additional names — same rule as a 3-ticket quantity

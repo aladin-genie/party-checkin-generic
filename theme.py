@@ -2183,6 +2183,40 @@ def sold_out_notice(message: str) -> str:
     """
 
 
+SEATS_UNAVAILABLE_MESSAGE = (
+    "We can't load seat availability right now — this is a temporary hiccup on our "
+    "end, not a sold-out event. Nothing is wrong with your payment or booking. "
+    "Please try again in a few minutes."
+)
+
+
+def seats_unavailable_notice(message: str = "") -> str:
+    """The notice shown in place of the Register form when seat availability
+    can't be determined right now (e.g. utils.seat_availability() reports
+    `unavailable=True` because the database is unreachable).
+
+    Deliberately NOT sold_out_notice(): this is an outage, not a sell-out, so
+    it must never say "sold out" — that exact confusion (a transient DB blip
+    rendering as "every ticket is claimed") is the bug this notice exists to
+    fix. Reuses closed_notice()'s informational styling (`.closed-notice`,
+    `--info-bg`/`--info-border`) rather than sold_out_notice()'s error-red
+    palette, matching the calmer, "come back shortly" tone of that copy
+    rather than an alarming one.
+
+    The caller must render this INSTEAD of the seat picker and form, not
+    alongside them: with availability unknown, nobody can say which seats
+    are actually free, so letting a guest pick and pay here risks a
+    double-booking that only the (working) database could have caught.
+    """
+    return f"""
+    <div class="closed-notice">
+        <div class="closed-notice-icon">🔌</div>
+        <div class="closed-notice-title">Seat availability is temporarily unavailable</div>
+        <div class="closed-notice-message">{html.escape(message or SEATS_UNAVAILABLE_MESSAGE)}</div>
+    </div>
+    """
+
+
 def empty_state(icon: str, title: str, message: str) -> str:
     """A friendly placeholder for an otherwise-empty section.
 
