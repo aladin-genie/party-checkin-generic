@@ -46,6 +46,7 @@ _CSS = """
     --gold-soft: #FCE8C6;      /* light saffron */
     --gold-soft-rgb: 252, 232, 198;
     --gold-dark: #C78A1E;
+    --gold-dark-rgb: 199, 138, 30;
     --leather: #6B1A1A;        /* deep maroon base */
     --leather-rgb: 107, 26, 26;
     --tan: #D67D4A;            /* warm orange accent */
@@ -1195,6 +1196,133 @@ a.sponsor-card:hover {
     color: var(--text-dim);
 }
 
+/* ── Cinema-style seat map ─────────────────────────────────────────────── */
+/* Purely visual: the slider above it drives the actual selection. The map
+   makes the tiered pricing tangible — guests see exactly which seats are
+   $50, $25, and $10 before they Zelle. */
+.seat-map-wrap {
+    background: linear-gradient(180deg, rgba(var(--leather-rgb), 0.18) 0%, var(--elevated) 100%);
+    border: 1px solid rgba(var(--gold-rgb), 0.22);
+    border-radius: var(--radius-lg);
+    padding: var(--space-5) var(--space-4);
+    margin: var(--space-4) 0;
+    text-align: center;
+}
+.seat-screen {
+    display: inline-block;
+    background: linear-gradient(90deg, rgba(var(--gold-rgb), 0.25), rgba(var(--gold-rgb), 0.10), rgba(var(--gold-rgb), 0.25));
+    color: var(--gold-soft);
+    font-family: 'Bitter', Georgia, serif;
+    font-weight: 700;
+    font-size: 0.9rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 8px 32px;
+    border-radius: var(--radius-pill);
+    margin-bottom: var(--space-4);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+.seat-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: var(--space-4);
+    align-items: center;
+}
+.seat-row {
+    display: flex;
+    justify-content: center;
+    gap: 5px;
+}
+.seat {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px 6px 10px 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.62rem;
+    font-weight: 700;
+    color: rgba(0, 0, 0, 0.65);
+    background: rgba(var(--gold-rgb), 0.18);
+    border: 1px solid rgba(var(--gold-rgb), 0.35);
+    box-shadow: inset 0 -2px 0 rgba(0, 0, 0, 0.2);
+}
+.seat-gold {
+    background: linear-gradient(180deg, var(--gold-soft) 0%, var(--gold) 100%);
+    border-color: rgba(var(--gold-dark-rgb, 199, 138, 30), 0.8);
+}
+.seat-tan {
+    background: linear-gradient(180deg, #F4C9A8 0%, var(--tan) 100%);
+    border-color: rgba(var(--tan-rgb), 0.85);
+}
+.seat-turquoise {
+    background: linear-gradient(180deg, #7EE6A8 0%, var(--turquoise) 100%);
+    border-color: rgba(var(--turquoise-rgb), 0.85);
+}
+.seat.selected {
+    box-shadow: 0 0 0 2px var(--text), 0 0 12px rgba(var(--gold-rgb), 0.55);
+    color: #000;
+}
+.seat-legend {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: var(--space-3);
+    margin-bottom: var(--space-3);
+}
+.seat-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.82rem;
+    color: var(--text-dim);
+    font-weight: 600;
+}
+.seat-dot {
+    width: 14px;
+    height: 14px;
+    border-radius: 4px 4px 6px 6px;
+}
+.seat-count {
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    font-weight: 600;
+}
+
+/* ── Seat price breakdown (subtotals per tier) ─────────────────────────── */
+.seat-breakdown {
+    background: rgba(0, 0, 0, 0.22);
+    border: 1px solid rgba(var(--gold-rgb), 0.18);
+    border-radius: var(--radius-md);
+    padding: var(--space-3) var(--space-4);
+    margin: 0 0 var(--space-4) 0;
+}
+.breakdown-line {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-3);
+    font-size: 0.9rem;
+    color: var(--text-dim);
+    padding: 4px 0;
+}
+.breakdown-line span:last-child {
+    font-weight: 700;
+    color: var(--gold-soft);
+    white-space: nowrap;
+}
+
+@media (max-width: 480px) {
+    .seat {
+        width: 22px;
+        height: 22px;
+        font-size: 0.5rem;
+        border-radius: 4px 4px 7px 7px;
+    }
+    .seat-row { gap: 3px; }
+    .seat-grid { gap: 4px; }
+}
+
 /* ── Guest-names requirement (how many names the ticket count needs) ───── */
 /* Sits between the ticket selector and the form, and re-renders every time
    the ticket count changes, so the guest learns how many names are wanted
@@ -2109,20 +2237,17 @@ def payment_card(zelle_info: str, tiers: list, ticket_count: int = 0) -> str:
     """
 
 
-def total_card(tickets: int, price: float, savings: float = 0.0) -> str:
+def total_card(tickets: int, total_cents: int, savings: float = 0.0) -> str:
     """The live-updating 'Total to Pay' card on the Register page.
 
-    `price` is the per-ticket price for THIS booking size
-    (config.ticket_price_dollars_for), not the base price — a group booking
-    must be told the number it should actually send via Zelle. `savings` is
-    what the group discount took off, shown only when there is some, so a
-    solo booking doesn't get a "you saved $0.00" line.
+    `total_cents` is the exact amount to Zelle for the selected seats.
+    `savings` is what the guest saved vs the base price, shown only when > 0.
     """
     tickets = int(tickets)
-    total = tickets * price
+    total = total_cents / 100
     plural = "s" if tickets != 1 else ""
     savings_html = (
-        f'<div class="total-savings">🎉 Group discount applied — you save '
+        f'<div class="total-savings">🎉 Tiered seating discount — you save '
         f"${savings:,.2f}</div>"
         if savings > 0
         else ""
@@ -2131,59 +2256,119 @@ def total_card(tickets: int, price: float, savings: float = 0.0) -> str:
     <div class="total-card">
         <div class="total-label">Total to Pay</div>
         <div class="total-value">${total:,.2f}</div>
-        <div class="total-caption">{tickets} ticket{plural} × ${price:.2f}</div>
+        <div class="total-caption">{tickets} seat{plural} selected</div>
         {savings_html}
     </div>
     """
 
 
 def next_tier_nudge(ticket_count: int, tier: dict, base_price_cents: int) -> str:
-    """"Add N more tickets and every ticket drops to $X" — or "" if not close.
+    """"Seat N costs less" — or "" if already on the cheapest tier.
 
     `tier` is a config.next_price_tier() payload (None when the booking is
-    already on the best tier, or when the next tier is past the
-    per-registration cap). Shown under the total, because the moment a guest
-    has picked a quantity is the moment this is worth knowing.
-
-    Deliberately states the extra tickets as tickets for *people* — one
-    ticket per person is the rule the rest of the form enforces, so this must
-    not read as an invitation to buy spare seats for nobody.
+    already on the best tier). Shown under the total.
     """
     if not tier:
         return ""
     try:
         count = int(ticket_count)
-        needed = int(tier["min"]) - count
+        next_seat = int(tier["min"])
         tier_price = int(tier["price_cents"]) / 100
     except (TypeError, ValueError, KeyError):
         return ""
-    if needed <= 0:
+    if next_seat <= count:
         return ""
 
-    # What they'd save overall by going up, versus their current total.
-    current_price_cents = base_price_cents
-    try:
-        current_price_cents = int(base_price_cents)
-    except (TypeError, ValueError):
-        pass
-    new_total = int(tier["min"]) * int(tier["price_cents"])
-    old_total = count * current_price_cents
-    delta = (old_total - new_total) / 100
-
-    saving_html = (
-        f" — that's <strong>${delta:,.2f} less</strong> in total, for "
-        f"{needed} more {'person' if needed == 1 else 'people'}"
-        if delta > 0
-        else ""
-    )
     return (
         '<div class="tier-nudge">'
         "<span class=\"tier-nudge-icon\">💡</span>"
-        f"<span>Booking for <strong>{int(tier['min'])}</strong> brings every ticket down to "
-        f"<strong>${tier_price:,.2f}</strong>{saving_html}. "
+        f"<span>Seat <strong>{next_seat}</strong> and above cost "
+        f"<strong>${tier_price:,.2f}</strong> each. "
         "Everyone coming needs their own ticket and their name below.</span>"
         "</div>"
     )
+
+
+def seat_map(ticket_count: int, max_seats: int = 100) -> str:
+    """Visual cinema-style seat map. Seats 1..ticket_count are highlighted.
+
+    Seats are colour-coded by price tier. The map is purely visual — the
+    actual selection happens via the slider above it.
+    """
+    try:
+        count = max(0, min(int(ticket_count), max_seats))
+    except (TypeError, ValueError):
+        count = 0
+
+    import config as _config
+
+    # Build tier lookup: seat_number -> css class suffix
+    tier_class = {}
+    tier_colors = ["gold", "tan", "turquoise"]
+    for idx, (start, end, price) in enumerate(_config.SEAT_TIERS):
+        cls = tier_colors[idx % len(tier_colors)]
+        for s in range(start, min(end, max_seats) + 1):
+            tier_class[s] = cls
+
+    cols = 10
+    rows = (max_seats + cols - 1) // cols
+    cells = []
+    for seat in range(1, max_seats + 1):
+        cls = tier_class.get(seat, "")
+        selected = " selected" if seat <= count else ""
+        cells.append(
+            f'<div class="seat seat-{cls}{selected}"><span>{seat}</span></div>'
+        )
+
+    grid = "\n".join(
+        '<div class="seat-row">' + "".join(cells[r * cols:(r + 1) * cols]) + "</div>"
+        for r in range(rows)
+    )
+
+    legend_items = []
+    for idx, (start, end, price) in enumerate(_config.SEAT_TIERS):
+        cls = tier_colors[idx % len(tier_colors)]
+        label = f"Seats {start}–{end}" if end <= max_seats else f"Seats {start}+"
+        legend_items.append(
+            f'<div class="seat-legend-item">'
+            f'<div class="seat-dot seat-{cls}"></div>'
+            f'<span>{label}: ${price / 100:,.2f}</span>'
+            f'</div>'
+        )
+
+    return f"""
+    <div class="seat-map-wrap">
+        <div class="seat-screen">🎭 Stage</div>
+        <div class="seat-grid">{grid}</div>
+        <div class="seat-legend">{''.join(legend_items)}</div>
+        <div class="seat-count">{count} of {max_seats} seats selected</div>
+    </div>
+    """
+
+
+def seat_breakdown(ticket_count: int) -> str:
+    """Human breakdown of how many seats fall in each tier and the subtotal."""
+    try:
+        count = max(0, int(ticket_count))
+    except (TypeError, ValueError):
+        count = 0
+
+    import config as _config
+
+    lines = []
+    for start, end, price in _config.SEAT_TIERS:
+        seats_in_tier = max(0, min(count, end) - start + 1)
+        if seats_in_tier <= 0:
+            continue
+        subtotal = seats_in_tier * price
+        lines.append(
+            f'<div class="breakdown-line">'
+            f'<span>{seats_in_tier} seat{"s" if seats_in_tier != 1 else ""} '
+            f'({start}–{min(end, count)}):</span>'
+            f'<span>${subtotal / 100:,.2f}</span>'
+            f'</div>'
+        )
+    return f'<div class="seat-breakdown">{"".join(lines)}</div>' if lines else ""
 
 
 def guest_names_requirement(ticket_count: int, provided: int = 0) -> str:

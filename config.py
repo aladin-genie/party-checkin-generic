@@ -97,7 +97,7 @@ LANDING_PAGE = "Register"
 # Optional: utils.resolve_image_src() returns "" for anything it can't
 # resolve, so blanking this (or deleting the file) makes both call sites
 # render nothing rather than break.
-EVENT_FLYER = "assets/flyer.png"
+EVENT_FLYER = ""
 
 
 # The gallery. Add real photos before the event. Each entry is either a
@@ -137,8 +137,8 @@ SPONSORS = []
 # price is shipped in code. The $20 -> $30 rise deployed correctly and the
 # live site kept charging $20, with nothing in the repo to explain why.
 # Changing the price is now a one-line edit here plus a redeploy, and what
-# the code says is what guests are charged. GROUP_DISCOUNT_TIERS below are
-# discounts *off* this number, so moving it moves every tier with it.
+# the code says is what guests are charged. SEAT_TIERS below are absolute
+# seat prices; only seat 1 falls back to this base price.
 TICKET_PRICE_CENTS = 5000
 
 
@@ -157,134 +157,111 @@ def ticket_price_dollars() -> float:
     return ticket_price_cents() / 100
 
 
-# ── Group discounts ──────────────────────────────────────────────────────────
-# A bigger booking pays less per ticket. Each tier is
-# (minimum tickets in ONE registration, discount per ticket in cents), and a
-# booking is charged at the last tier whose minimum it reaches. At the
-# $50.00 base that gives the requested pricing:
+# ── Seat pricing ─────────────────────────────────────────────────────────────
+# Cinema-style tiered seating: each numbered seat has its own price.
+# Seat 1–25 cost $50, seats 26–75 cost $25, seats 76–100 cost $10.
+# A booking of N consecutive seats pays the sum of seats 1..N.
 #
-#     1–25 tickets   →  $50.00 each
-#     26–75 tickets  →  $25.00 each
-#     76+ tickets    →  $10.00 each
+#     seat 1–25   →  $50.00 each
+#     seat 26–75  →  $25.00 each
+#     seat 76–100 →  $10.00 each
 #
-# Note the boundaries are INCLUSIVE of the lower bound: a booking of exactly
-# 26 pays $25, and exactly 76 pays $10. Guests price their group off the
-# displayed table, so the app has to agree with it at the boundary or someone
-# Zelles the wrong amount.
-#
-# Stored as money OFF the base rather than as absolute prices so that raising
-# TICKET_PRICE_CENTS moves every tier with it — otherwise a price rise would
-# silently turn the "discounts" into surcharges.
-#
-# The discount is per registration, not per person across registrations: 76
-# tickets bought in one booking get the 76+ rate; separate smaller bookings
-# are charged at their own tier. That is the only rule the app can actually
-# enforce, since separate registrations are separate people paying separately.
-GROUP_DISCOUNT_TIERS = (
-    (26, 2500),   # 26+ tickets: $25.00 off each → $25/ticket
-    (76, 4000),   # 76+ tickets: $40.00 off each → $10/ticket
+# Boundaries are INCLUSIVE. The seat map on the Register page shows the
+# tiers so guests know exactly what they are paying before they Zelle.
+SEAT_TIERS = (
+    (1, 25, 5000),    # seats 1–25: $50.00 each
+    (26, 75, 2500),   # seats 26–75: $25.00 each
+    (76, 100, 1000),  # seats 76–100: $10.00 each
 )
 
 
-def ticket_price_cents_for(ticket_count) -> int:
-    """Per-ticket price in cents for a booking of `ticket_count` tickets.
+def seat_price_cents(seat_number) -> int:
+    """Price in cents for a single numbered seat.
 
-    Must never raise: this feeds the price shown on the form, and a garbage
-    ticket count (the selector is a client-side widget) has to fall back to
-    the full base price rather than take the page down. Falling back *up* to
-    the base price is the safe direction — it can never invent a discount
-    nobody is entitled to.
+    Must never raise: a garbage seat number falls back to the base price.
     """
-    base = ticket_price_cents()
     try:
-        count = int(ticket_count)
+        n = int(seat_number)
     except (TypeError, ValueError):
-        return base
+        return TICKET_PRICE_CENTS
+    for start, end, price in SEAT_TIERS:
+        if start <= n <= end:
+            return price
+    return TICKET_PRICE_CENTS
 
-    discount = 0
-    # Sorted rather than trusting the literal above to stay in order — a tier
-    # appended out of sequence would otherwise silently win over a larger one.
-    for minimum, off in sorted(GROUP_DISCOUNT_TIERS):
-        if count >= minimum:
-            discount = off
-    # A misconfigured tier must not produce a free (or negative) ticket.
-    return max(base - discount, 0)
+
+def ticket_price_cents_for(ticket_count) -> int:
+    """Price of the highest-numbered seat in a booking of `ticket_count`.
+
+    This is the marginal price: the price the next seat would add. Used for
+    the live total and tier hints. Falls back to the base price on bad input.
+    """
+    try:
+        count = max(1, int(ticket_count))
+    except (TypeError, ValueError):
+        return TICKET_PRICE_CENTS
+    return seat_price_cents(count)
 
 
 def ticket_price_dollars_for(ticket_count) -> float:
-    """Per-ticket price in dollars for a booking of `ticket_count` tickets."""
+    """Price in dollars of the highest-numbered seat in the booking."""
     return ticket_price_cents_for(ticket_count) / 100
 
 
 def booking_total_cents(ticket_count) -> int:
-    """What a booking of `ticket_count` tickets costs in total, in cents.
+    """Total cost in cents for seats 1..`ticket_count`.
 
     Integer cents throughout — the amount a guest is told to Zelle must not
-    drift by a rounding error, and float dollars can't represent every price
-    exactly.
+    drift by a rounding error.
     """
     try:
         count = max(0, int(ticket_count))
     except (TypeError, ValueError):
         count = 0
-    return count * ticket_price_cents_for(count)
+    return sum(seat_price_cents(i) for i in range(1, count + 1))
 
 
 def booking_total_dollars(ticket_count) -> float:
-    """What a booking of `ticket_count` tickets costs in total, in dollars."""
+    """Total cost in dollars for seats 1..`ticket_count`."""
     return booking_total_cents(ticket_count) / 100
 
 
 def booking_savings_cents(ticket_count) -> int:
-    """How much a booking saves against paying the base price per ticket.
-
-    0 for any booking that isn't big enough for a discount.
-    """
+    """How much is saved vs paying the base price for every seat."""
     try:
         count = max(0, int(ticket_count))
     except (TypeError, ValueError):
         return 0
-    return count * (ticket_price_cents() - ticket_price_cents_for(count))
+    base_total = count * TICKET_PRICE_CENTS
+    return base_total - booking_total_cents(count)
 
 
 def price_tiers() -> list:
-    """The whole price table, ready to display.
+    """The seat-price table, ready to display.
 
-    Returns a list of {"min", "max", "price_cents"} dicts covering every
-    booking size from 1 upward, with `max` = None on the open-ended top
-    tier. Derived from GROUP_DISCOUNT_TIERS rather than written out
-    separately, so what the Register page shows a guest can't drift from
-    what ticket_price_cents_for() actually charges them.
+    Returns a list of {"min", "max", "price_cents"} dicts covering each
+    contiguous seat tier, sorted low-to-high so the rendering order is stable
+    even if SEAT_TIERS is ever edited out of order. The Register page renders
+    this as the seat-map legend so guests see the price of each seat range.
     """
-    minimums = sorted({int(m) for m, _off in GROUP_DISCOUNT_TIERS if int(m) > 1})
-    boundaries = [1] + minimums
-
-    tiers = []
-    for i, start in enumerate(boundaries):
-        end = boundaries[i + 1] - 1 if i + 1 < len(boundaries) else None
-        tiers.append({
-            "min": start,
-            "max": end,
-            "price_cents": ticket_price_cents_for(start),
-        })
-    return tiers
+    return [
+        {"min": start, "max": end, "price_cents": price}
+        for start, end, price in sorted(SEAT_TIERS)
+    ]
 
 
 def next_price_tier(ticket_count):
-    """The next cheaper tier a booking could reach, or None.
+    """The next cheaper seat tier a booking could reach, or None.
 
-    Used to tell someone booking 10 tickets that an 11th would drop the
-    price of every ticket. Returns None when the booking is already on the
-    best tier, or when reaching the next one would exceed
-    MAX_TICKETS_PER_REGISTRATION (there's no point advertising a price the
-    form won't let them buy).
+    Used to tell someone booking 25 seats that a 26th seat would cost less.
+    Returns None when already on the best tier.
     """
     try:
         count = int(ticket_count)
     except (TypeError, ValueError):
         return None
 
-    current_price = ticket_price_cents_for(count)
+    current_price = seat_price_cents(count)
     for tier in price_tiers():
         if tier["min"] > count and tier["price_cents"] < current_price:
             if tier["min"] > MAX_TICKETS_PER_REGISTRATION:
@@ -314,13 +291,9 @@ def max_total_tickets() -> int:
 # also clamps its selector to whatever is actually left, so the effective
 # maximum is min(this, tickets remaining).
 #
-# The top tier starts at 76 tickets (see GROUP_DISCOUNT_TIERS), so the cap
-# must be at least that high or the tier becomes unbuyable —
-# config.next_price_tier() refuses to advertise a tier past this cap for the
-# same reason, and test_top_discount_tier_is_actually_bookable fails if it
-# ever slips below.
-#
-# Set to 100 to leave headroom above the 76+ tier.
+# The top seat tier ends at 100 (see SEAT_TIERS), so the cap must be at least
+# that high or the cheapest seats become unbuyable. Set to 100 to match the
+# seat map.
 #
 # Raising this raises utils.MAX_GUEST_NAMES (this minus one), so a 100-ticket
 # booking must name its other 99 guests. utils.GUEST_NAMES_MAX_CHARS — the

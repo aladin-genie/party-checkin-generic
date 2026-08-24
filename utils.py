@@ -760,8 +760,8 @@ def _named_guests_expr():
 def _expected_revenue_cents(session) -> int:
     """Total the guest list should have brought in, in cents.
 
-    Group discounts are priced per booking (see config.GROUP_DISCOUNT_TIERS),
-    so this has to charge each booking at its own tier and sum the results —
+    Seat pricing is tiered per numbered seat (see config.SEAT_TIERS), so each
+    booking is charged the sum of seats 1..N via config.booking_total_cents —
     `total_tickets × base_price` would over-state the take on every group.
 
     Integer cents throughout: this figure is meant to be reconciled against a
@@ -773,7 +773,7 @@ def _expected_revenue_cents(session) -> int:
         Guest.ticket_count, func.count(Guest.id)
     ).group_by(Guest.ticket_count):
         count = int(ticket_count or 0)
-        total_cents += int(bookings) * count * config.ticket_price_cents_for(count)
+        total_cents += int(bookings) * config.booking_total_cents(count)
     return total_cents
 
 

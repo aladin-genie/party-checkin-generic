@@ -517,14 +517,6 @@ def page_register():
     # landing page — a guest arriving from the flyer may never see Home's hero.
     st.markdown(theme.event_strip(), unsafe_allow_html=True)
 
-    # The flyer, collapsed. Register is a form a guest is trying to get
-    # through, so a tall poster must not sit between them and it — but the
-    # flyer is where most of them came from, so it stays one tap away.
-    flyer_src = utils.event_flyer_src()
-    if flyer_src:
-        with st.expander("📜 See the party flyer", expanded=False):
-            st.markdown(theme.flyer_card(flyer_src), unsafe_allow_html=True)
-
     # ── Zelle Payment Info Card ────────────────────────────────────────────
     # Carries the whole group-discount table, with the row for the current
     # selection highlighted. It has to render BEFORE the selector (that's
@@ -552,30 +544,33 @@ def page_register():
     except (TypeError, ValueError):
         st.session_state["ticket_count"] = 1
 
-    st.markdown(theme.section_header("Select Tickets"), unsafe_allow_html=True)
-    ticket_count = st.number_input(
-        "Number of Tickets *",
+    st.markdown(theme.section_header("Select Seats"), unsafe_allow_html=True)
+    ticket_count = st.slider(
+        "Number of Seats *",
         min_value=1,
         max_value=max_tickets,
         value=1,
         step=1,
         key="ticket_count",
-        help=f"Select number of tickets (up to {max_tickets}) — one per person. "
-             "The price per ticket drops for larger groups, and the total updates "
+        help=f"Select number of seats (up to {max_tickets}) — one per person. "
+             "Seats 1–25 are $50, 26–75 are $25, and 76+ are $10. The total updates "
              "automatically as you change it.",
     )
-    # Priced at this booking's own tier, not the base rate — the total is the
-    # number the guest is about to Zelle, so it must be the real one.
-    unit_price = config.ticket_price_dollars_for(ticket_count)
+    # Cinema-style visual map so guests see exactly which seats cost what.
+    st.markdown(theme.seat_map(ticket_count), unsafe_allow_html=True)
+    st.markdown(theme.seat_breakdown(ticket_count), unsafe_allow_html=True)
+    # The exact amount the guest is about to Zelle.
     st.markdown(
         theme.total_card(
-            ticket_count, unit_price, config.booking_savings_cents(ticket_count) / 100
+            ticket_count,
+            config.booking_total_cents(ticket_count),
+            config.booking_savings_cents(ticket_count) / 100,
         ),
         unsafe_allow_html=True,
     )
     # Worth knowing right after picking a quantity: how close they are to the
-    # next tier. Renders nothing when they're already on the best one, or when
-    # reaching it would exceed the per-registration cap.
+    # next cheaper tier. Renders nothing when they're already on the best one,
+    # or when reaching it would exceed the per-registration cap.
     st.markdown(
         theme.next_tier_nudge(
             ticket_count,
