@@ -207,6 +207,42 @@ def _cached_qr_image(qr_code: str) -> bytes:
     return utils.generate_qr_image(qr_code)
 
 
+def _db_ok() -> bool:
+    """Is the guest database reachable? True when we can't tell.
+
+    Wrapped in getattr rather than calling utils.db_health() directly, for
+    the reason AGENTS.md spells out: Streamlit Cloud can execute a freshly
+    deployed streamlit_app.py against a `utils` module still cached in the
+    running process from BEFORE that deploy. The new page code then calls an
+    attribute the old module doesn't have and every single page load dies
+    with AttributeError — a total outage caused by a health check whose only
+    job was to prevent an outage. That is exactly what happened on the deploy
+    that introduced db_health(), and it is why _safe_active_count() below
+    guards touch_session/active_session_count the same way.
+
+    Fails OPEN (returns True) on any problem: if the probe itself is
+    unavailable we must keep serving the app and let the individual service
+    calls degrade on their own, never blanket-block every page.
+    """
+    try:
+        probe = getattr(utils, "db_health", None)
+        if probe is None:
+            return True
+        return bool(probe().get("ok", True))
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"db health probe unavailable, assuming reachable: {e}")
+        return True
+
+
+def _db_health_detail() -> str:
+    """Short error string from the health probe, or "" if unavailable."""
+    try:
+        probe = getattr(utils, "db_health", None)
+        return str(probe().get("error", "")) if probe else ""
+    except Exception:
+        return ""
+
+
 def _safe_active_count(register: bool = True) -> int:
     """Active-session count, or 0 if it can't be determined.
 
@@ -350,7 +386,7 @@ def page_home():
         unsafe_allow_html=True,
     )
 
-    if not utils.db_health()["ok"]:
+    if not _db_ok():
         # Every number in this section is a live DB read. Showing them as
         # zeros here (the shape they'd degrade to) would read exactly like
         # "nobody's registered" — false, and the opposite of reassuring
@@ -1043,7 +1079,7 @@ def page_my_qr():
     with header_col2:
         _home_button(key="home_my_qr")
 
-    if not utils.db_health()["ok"]:
+    if not _db_ok():
         # Neither path below can succeed without the database: the guest_id
         # shortcut would otherwise call utils.get_guest() (which degrades to
         # None on failure) and show a flatly false "Guest not found.", and
@@ -1174,7 +1210,7 @@ def page_scanner():
     with header_col2:
         _home_button(key="home_scanner")
 
-    if not utils.db_health()["ok"]:
+    if not _db_ok():
         # Skip everything below, not just the camera/manual-entry inputs:
         # the stat tiles read from _cached_stats(), which degrades to zeros
         # on failure — rendering "No guests yet" during an outage would be a
@@ -1597,7 +1633,7 @@ def page_admin():
         st.session_state["admin_authenticated"] = False
         st.rerun()
 
-    if not utils.db_health()["ok"]:
+    if not _db_ok():
         # Password check above only reads a secret (verify_admin_password),
         # so login itself must keep working during an outage — an admin
         # locked out of their own dashboard is the last thing this needs.
@@ -2322,9 +2358,22 @@ def main():
     # on. Individual page functions below call utils.db_health() again
     # (cheap: memoized for a few seconds) to decide what DB-backed content to
     # skip; they don't re-render this banner themselves.
-    db_health = utils.db_health()
-    if not db_health["ok"]:
-        st.markdown(theme.db_unavailable_banner(db_health.get("error", "")), unsafe_allow_html=True)
+    if not _db_ok():
+        # getattr for the same stale-module reason as _db_ok(): a freshly
+        # deployed page file can run against a `theme` module cached from
+        # before the deploy, and an unguarded new builder would then kill
+        # every page load. Fall back to a plain st.warning, which always
+        # exists, rather than losing the message entirely.
+        banner = getattr(theme, "db_unavailable_banner", None)
+        if banner is not None:
+            st.markdown(banner(_db_health_detail()), unsafe_allow_html=True)
+        else:
+            st.warning(
+                "We can't reach the guest database right now, so registrations and "
+                "check-ins are paused. This is a temporary problem on our end — "
+                "please try again in a few minutes.",
+                icon="🗄️",
+            )
 
     if is_busy:
         st.markdown(theme.busy_banner(), unsafe_allow_html=True)
