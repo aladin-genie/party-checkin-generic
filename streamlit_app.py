@@ -551,6 +551,7 @@ def page_register():
         st.session_state["ticket_count"] = 1
 
     st.markdown(theme.section_header("Select Seats"), unsafe_allow_html=True)
+    st.markdown(theme.venue_info_card(), unsafe_allow_html=True)
     ticket_count = st.slider(
         "Number of Seats *",
         min_value=1,
@@ -558,9 +559,9 @@ def page_register():
         value=1,
         step=1,
         key="ticket_count",
-        help=f"Select number of seats (up to {max_tickets}) — one per person. "
-             "Seats 1–25 are $50, 26–75 are $25, and 76+ are $10. The total updates "
-             "automatically as you change it.",
+        help=f"Select paid seats (up to {max_tickets}) — one per person age 12+. "
+             "Seats 1–25 are $50, 26–75 are $25, and 76+ are $10. Kids under 12 are free. "
+             "The total updates automatically as you change it.",
     )
     # Cinema-style visual map so guests see exactly which seats cost what.
     st.markdown(theme.seat_map(ticket_count), unsafe_allow_html=True)

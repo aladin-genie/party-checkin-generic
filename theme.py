@@ -1231,7 +1231,7 @@ a.sponsor-card:hover {
 .seat-grid {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
     margin-bottom: var(--space-4);
     align-items: center;
 }
@@ -1241,18 +1241,22 @@ a.sponsor-card:hover {
     gap: 5px;
 }
 .seat {
-    width: 28px;
-    height: 28px;
-    border-radius: 6px 6px 10px 10px;
+    width: 26px;
+    height: 26px;
+    border-radius: 4px 4px 8px 8px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 0.62rem;
+    font-size: 0.6rem;
     font-weight: 700;
     color: rgba(0, 0, 0, 0.65);
     background: rgba(var(--gold-rgb), 0.18);
     border: 1px solid rgba(var(--gold-rgb), 0.35);
     box-shadow: inset 0 -2px 0 rgba(0, 0, 0, 0.2);
+}
+/* Aisle gap: every 5th seat gets extra right margin to create a center aisle. */
+.seat.aisle {
+    margin-right: 14px;
 }
 .seat-gold {
     background: linear-gradient(180deg, var(--gold-soft) 0%, var(--gold) 100%);
@@ -1320,13 +1324,14 @@ a.sponsor-card:hover {
 
 @media (max-width: 480px) {
     .seat {
-        width: 22px;
-        height: 22px;
-        font-size: 0.5rem;
-        border-radius: 4px 4px 7px 7px;
+        width: 20px;
+        height: 20px;
+        font-size: 0.48rem;
+        border-radius: 3px 3px 6px 6px;
     }
+    .seat.aisle { margin-right: 10px; }
     .seat-row { gap: 3px; }
-    .seat-grid { gap: 4px; }
+    .seat-grid { gap: 5px; }
 }
 
 /* ── Guest-names requirement (how many names the ticket count needs) ───── */
@@ -1358,6 +1363,46 @@ a.sponsor-card:hover {
 .guest-req-count {
     font-weight: 800;
     color: var(--gold);
+}
+
+/* ── Venue info card ──────────────────────────────────────────────────── */
+.venue-info-card {
+    background: linear-gradient(160deg, rgba(var(--leather-rgb), 0.18) 0%, var(--elevated) 100%);
+    border: 1px solid rgba(var(--gold-rgb), 0.22);
+    border-radius: var(--radius-lg);
+    padding: var(--space-4) var(--space-5);
+    margin: 0 0 var(--space-4) 0;
+}
+.venue-info-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: var(--space-3);
+}
+.venue-info-icon { font-size: 1.4rem; }
+.venue-info-title {
+    font-family: 'Bitter', Georgia, serif;
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--gold-soft);
+}
+.venue-info-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px var(--space-3);
+    padding: 6px 0;
+    border-top: 1px solid var(--border);
+    font-size: 0.9rem;
+}
+.venue-info-row:first-of-type { border-top: none; }
+.venue-info-label {
+    font-weight: 700;
+    color: var(--gold);
+    min-width: 90px;
+}
+.venue-info-value {
+    color: var(--text-dim);
+    flex: 1;
 }
 
 /* ── Stepper ───────────────────────────────────────────────────────────── */
@@ -2306,10 +2351,11 @@ def next_tier_nudge(ticket_count: int, tier: dict, base_price_cents: int) -> str
 
 
 def seat_map(ticket_count: int, max_seats: int = 100) -> str:
-    """Visual cinema-style seat map. Seats 1..ticket_count are highlighted.
+    """Visual sanctuary-style seat map. Seats 1..ticket_count are highlighted.
 
     Seats are colour-coded by price tier. The map is purely visual — the
-    actual selection happens via the slider above it.
+    actual selection happens via the slider above it — and is styled like
+    rows of chairs in the Unity of Dallas Sanctuary rather than a cinema.
     """
     try:
         count = max(0, min(int(ticket_count), max_seats))
@@ -2332,8 +2378,10 @@ def seat_map(ticket_count: int, max_seats: int = 100) -> str:
     for seat in range(1, max_seats + 1):
         cls = tier_class.get(seat, "")
         selected = " selected" if seat <= count else ""
+        # Add an aisle gap between columns 5 and 6.
+        aisle = " aisle" if seat % cols == 5 else ""
         cells.append(
-            f'<div class="seat seat-{cls}{selected}"><span>{seat}</span></div>'
+            f'<div class="seat seat-{cls}{selected}{aisle}"><span>{seat}</span></div>'
         )
 
     grid = "\n".join(
@@ -2354,7 +2402,7 @@ def seat_map(ticket_count: int, max_seats: int = 100) -> str:
 
     return f"""
     <div class="seat-map-wrap">
-        <div class="seat-screen">🎭 Stage</div>
+        <div class="seat-screen">🙏 Altar</div>
         <div class="seat-grid">{grid}</div>
         <div class="seat-legend">{''.join(legend_items)}</div>
         <div class="seat-count">{count} of {max_seats} seats selected</div>
@@ -2463,6 +2511,38 @@ def food_count_requirement(ticket_count: int, veg_count: int = 0, non_veg_count:
         f"({veg} veg + {non_veg} non-veg), so {html.escape(detail)}</span>"
         "</div>"
     )
+
+
+def venue_info_card() -> str:
+    """A compact venue info card for the Register page.
+
+    Covers parking, arrival time, and house rules so guests have the key
+    logistical details before they complete registration.
+    """
+    return f"""
+    <div class="venue-info-card">
+        <div class="venue-info-head">
+            <span class="venue-info-icon">📍</span>
+            <span class="venue-info-title">Venue &amp; Arrival Info</span>
+        </div>
+        <div class="venue-info-row">
+            <span class="venue-info-label">Location</span>
+            <span class="venue-info-value">{html.escape(config.VENUE_NAME)}, {html.escape(config.VENUE_ADDRESS)}</span>
+        </div>
+        <div class="venue-info-row">
+            <span class="venue-info-label">Parking</span>
+            <span class="venue-info-value">Free parking on the Unity of Dallas campus.</span>
+        </div>
+        <div class="venue-info-row">
+            <span class="venue-info-label">Doors</span>
+            <span class="venue-info-value">Doors open before the event; plan to arrive early for parking and seating.</span>
+        </div>
+        <div class="venue-info-row">
+            <span class="venue-info-label">House rule</span>
+            <span class="venue-info-value">The building must be cleared by 10:00 PM.</span>
+        </div>
+    </div>
+    """
 
 
 def stepper(current_step: int, steps: list = None) -> str:
