@@ -29,11 +29,11 @@ CHART_COLOR = "#D4AF37"
 
 _CSS = """
 <style>
-/* Rye is the western display face — decorative, so it is used ONLY for the
-   two brand moments (hero title, brand bar). Bitter, a slab serif, carries
-   the headings: it reads as period-western without costing legibility. Body
-   copy stays Inter, because guests fill this form in on a phone. */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Bitter:wght@600;700;800&family=Rye&display=swap');
+/* Typography: Tunga carries the two brand moments (hero title, brand bar)
+   with a Kannada-traditional feel. Bitter, a sturdy slab serif, carries
+   headings so they read well on a phone in a dim ballroom. Body copy stays
+   Inter for clarity at small sizes. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Bitter:wght@600;700;800&family=Tunga&family=Noto+Sans+Kannada:wght@400;500;600;700&display=swap');
 
 :root {
     /* ── Colour tokens: Yakshagana ────────────────────────────────────
@@ -119,10 +119,10 @@ html, body, [class*="css"] {
     font-family: 'Inter', sans-serif !important;
 }
 
-/* Tooled-leather ground: a warm gradient, plus two very faint radial pools
-   that suggest lamplight on hide without ever competing with the text on
-   top of it. Pure CSS — no image request, nothing extra to load on a phone
-   tethered to ballroom wifi. */
+/* Deep maroon stage curtain ground: a warm gradient, plus two very faint
+   radial pools that suggest temple-lamplight without competing with the
+   text on top of it. Pure CSS — no image request, nothing extra to load on
+   a phone tethered to ballroom wifi. */
 .stApp {
     background:
         radial-gradient(900px 500px at 12% -8%, rgba(var(--leather-rgb), 0.30) 0%, transparent 60%),
@@ -226,10 +226,10 @@ select:focus-visible,
    and the sidebar collapse/expand toggle (data-testid="stBaseButton-headerNoPadding") —
    both are plain <button> elements that would otherwise pick up this gold treatment
    too. They get their own dedicated styling further down. */
-/* Branded brass: the gold gradient stays because dark-on-gold is the highest
-   contrast pairing available here and these are the buttons a guest has to
-   find on a phone in a dim ballroom. The western read comes from the slab
-   face and the darker tooled edge, not from dropping the contrast. */
+/* Gold-accented action buttons: dark-on-gold is the highest contrast
+   pairing available here, so these are the buttons a guest has to find on a
+   phone in a dim ballroom. The traditional read comes from the slab face
+   and the deep maroon edge, not from dropping the contrast. */
 button:not([role="tab"]):not([data-testid="stBaseButton-headerNoPadding"]),
 .stButton > button {
     min-height: 48px !important;
@@ -243,7 +243,7 @@ button:not([role="tab"]):not([data-testid="stBaseButton-headerNoPadding"]),
     border: 1px solid rgba(90, 55, 15, 0.55) !important;
     box-shadow: var(--shadow-gold) !important;
 }
-/* Secondary buttons are worn leather rather than grey glass. */
+/* Secondary buttons are deep maroon rather than grey glass. */
 button[kind="secondary"], .stButton > button[kind="secondary"] {
     background: linear-gradient(180deg, rgba(var(--leather-rgb), 0.45) 0%, rgba(var(--leather-rgb), 0.22) 100%) !important;
     color: var(--gold-soft) !important;
@@ -279,7 +279,7 @@ input::placeholder, .stTextInput > div > div > input::placeholder {
     color: var(--text-dimmer) !important;
 }
 
-/* ── Cards / containers: tooled leather ───────────────────────────────── */
+/* ── Cards / containers: carved wooden panels ─────────────────────────── */
 div[data-testid="stContainer"] {
     border-radius: var(--radius-lg) !important;
     background: linear-gradient(180deg, rgba(var(--leather-rgb), 0.16) 0%, var(--elevated) 100%) !important;
@@ -302,13 +302,14 @@ div[data-testid="stContainer"] {
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
     border: 1px solid rgba(var(--tan-rgb), 0.30);
-    /* Brass rail along the bottom edge — the saloon-sign detail that makes
-       the sticky bar read as part of the theme rather than browser chrome. */
+    /* Gold border along the bottom edge — the temple-frame detail that
+       makes the sticky bar read as part of the theme rather than browser
+       chrome. */
     border-bottom: 2px solid rgba(var(--gold-rgb), 0.55);
     border-radius: var(--radius-md);
 }
 .brand-bar-title {
-    font-family: 'Rye', 'Bitter', Georgia, serif;
+    font-family: 'Tunga', 'Bitter', Georgia, serif;
     font-weight: 400;
     font-size: 0.95rem;
     color: var(--gold-soft);
@@ -356,8 +357,8 @@ div[data-testid="stContainer"] {
 }
 
 /* ── Pills / badges ────────────────────────────────────────────────────── */
-/* Leather luggage tags: warm fill, tan edge, and a dashed inner rule that
-   reads as saddle stitching. */
+/* Temple-festival badges: warm fill, tan edge, and a dashed inner rule
+   that reads as hand-stitched border trim. */
 .pill, .badge {
     position: relative;
     display: inline-flex;
@@ -394,7 +395,8 @@ div[data-testid="stContainer"] {
 }
 
 /* ── Hero banner ───────────────────────────────────────────────────────── */
-/* The branded hide: leather wash, brass edge, and a stitched inner border. */
+/* The proscenium banner: maroon wash, gold edge, and a stitched inner
+   border like a Yakshagana back curtain. */
 .hero-banner {
     position: relative;
     background:
@@ -417,7 +419,7 @@ div[data-testid="stContainer"] {
     pointer-events: none;
 }
 .hero-title {
-    font-family: 'Rye', 'Bitter', Georgia, serif;
+    font-family: 'Tunga', 'Bitter', Georgia, serif;
     font-size: 2.1rem;
     font-weight: 400;
     margin: 0 0 10px 0;
@@ -427,9 +429,10 @@ div[data-testid="stContainer"] {
     background-clip: text;
     letter-spacing: 0.5px;
     line-height: 1.25;
-    /* Rye has no bold weight, so the "stamped into leather" depth comes from
-       a drop-shadow filter rather than a heavier face. filter (not
-       text-shadow) because the glyphs are painted with background-clip. */
+    /* Tunga is a single-weight Kannada face, so the "carved in temple stone"
+       depth comes from a drop-shadow filter rather than a heavier face.
+       filter (not text-shadow) because the glyphs are painted with
+       background-clip. */
     filter: drop-shadow(0 2px 0 rgba(0, 0, 0, 0.55));
 }
 .hero-subtitle {
@@ -439,9 +442,9 @@ div[data-testid="stContainer"] {
     font-weight: 700;
     margin-bottom: 2px;
 }
-/* The Kannada line from the flyer. Kannada has taller stacked glyphs than
-   Latin, so it gets its own line-height and falls back to the system Kannada
-   face — Rye/Bitter have no Kannada coverage at all. */
+/* The Kannada line from the event branding. Kannada has taller stacked
+   glyphs than Latin, so it gets its own line-height and a dedicated Kannada
+   face — Tunga/Bitter have no Kannada coverage at all. */
 .hero-subtitle-local {
     font-family: 'Noto Sans Kannada', 'Tunga', 'Inter', sans-serif;
     font-size: 1rem;
@@ -489,6 +492,8 @@ div[data-testid="stContainer"] {
 }
 
 /* ── Event strip (Register page) ───────────────────────────────────────── */
+/* A horizontal strip that echoes the maroon-and-gold border of a temple
+   festival notice. */
 /* Wraps to as many lines as it needs on a phone rather than shrinking the
    text — a venue address that has to be squinted at is worse than one that
    takes two lines. */
@@ -517,7 +522,7 @@ div[data-testid="stContainer"] {
 }
 
 /* ── Section header ────────────────────────────────────────────────────── */
-/* A short brass rule under each heading — the stitched seam that runs
+/* A short gold rule under each heading — the repeated motif that runs
    through the whole theme, at section scale. */
 .section-header {
     margin: var(--space-6) 0 var(--space-3) 0;
@@ -836,9 +841,9 @@ div[data-testid="stContainer"] {
 }
 
 /* ── Event flyer ───────────────────────────────────────────────────────── */
-/* Framed like something pinned to a board: brass edge, stitched inner rule,
-   and a height cap so a tall portrait poster stays a glance rather than a
-   wall you have to scroll past. */
+/* Framed like a festival poster on a temple notice board: gold edge,
+   stitched inner rule, and a height cap so a tall portrait poster stays a
+   glance rather than a wall you have to scroll past. */
 .flyer-card {
     position: relative;
     display: flex;
@@ -1033,7 +1038,8 @@ a.sponsor-card:hover {
 }
 
 /* ── Payment card ──────────────────────────────────────────────────────── */
-/* Nailed to the saloon wall: heavier board, brass tack line along the top. */
+/* The donation/prasada board: heavier panel, gold-maroon-green trim line
+   along the top. */
 .payment-card {
     background: linear-gradient(160deg, rgba(var(--leather-rgb), 0.22) 0%, var(--surface) 45%, #150E08 100%);
     border: 2px solid rgba(var(--gold-rgb), 0.45);
@@ -1324,8 +1330,8 @@ a.sponsor-card:hover {
 }
 
 /* ── Guest-names requirement (how many names the ticket count needs) ───── */
-/* Sits between the ticket selector and the form, and re-renders every time
-   the ticket count changes, so the guest learns how many names are wanted
+/* Sits between the seat selector and the form, and re-renders every time
+   the seat count changes, so the guest learns how many names are wanted
    before they reach the field rather than from a validation error after
    submitting. See theme.guest_names_requirement(). */
 .guest-req {
