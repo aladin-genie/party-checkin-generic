@@ -59,10 +59,10 @@ EVENT_DATE_SHORT = "Fri, Jan 1, 2027"
 # well as the badge on the hero, so guests arriving from the flyer land
 # somewhere that looks like the flyer.
 EVENT_THEME = "Yakshagana"
-EVENT_THEME_NOTE = "Traditional attire encouraged"
+EVENT_THEME_NOTE = "Traditional attire & face paint encouraged"
 
 # Optional local-language tagline shown under the tagline on the hero.
-EVENT_TAGLINE_LOCAL = ""
+EVENT_TAGLINE_LOCAL = "ಯಕ್ಷಗಾನ — ಕರ್ನಾಟಕದ ಗೌರವ"
 
 VENUE_NAME = "DFW Metroplex Venue TBD"
 VENUE_ADDRESS = "DFW Metroplex, TX (address TBD)"
@@ -108,7 +108,12 @@ EVENT_FLYER = "assets/flyer.png"
 # image.
 #
 # Order is display order, so the strongest real photo leads.
-PHOTOS = []
+PHOTOS = [
+    {"src": "assets/photos/yakshagana-on-stage.jpg",
+     "caption": "Yakshagana on stage — dance, drama, and devotion"},
+    {"src": "assets/photos/yakshagana-krishna.jpg",
+     "caption": "The vibrant art of Yakshagana from Karnataka"},
+]
 
 # Tier display order, best first. A sponsor whose `tier` isn't listed here is
 # still shown — it just sorts to the end under its own heading, so a new tier

@@ -36,39 +36,38 @@ _CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&family=Bitter:wght@600;700;800&family=Rye&display=swap');
 
 :root {
-    /* ── Colour tokens: dark event-neutral ─────────────────────────────
-       Worn leather, saddle tan, brass rope, rust, and turquoise — a
-       western-tinged palette that reads well on phones, at night, in a
-       ballroom. Update `config.EVENT_THEME` and `config.EVENT_THEME_NOTE`
-       to match your real flyer; the colours stay dark so the page is not
-       reads. */
-    --gold: #D4AF37;           /* brass / rope */
-    --gold-rgb: 212, 175, 55;
-    --gold-soft: #F0DCB4;      /* parchment */
-    --gold-soft-rgb: 240, 220, 180;
-    --gold-dark: #A9762A;
-    --leather: #8B5A2B;
-    --leather-rgb: 139, 90, 43;
-    --tan: #C08552;
-    --tan-rgb: 192, 133, 82;
-    --rust: #B3421E;           /* branding iron */
-    --rust-rgb: 179, 66, 30;
-    --turquoise: #3FA9A0;      /* belt-buckle turquoise */
-    --turquoise-rgb: 63, 169, 160;
+    /* ── Colour tokens: Yakshagana ────────────────────────────────────
+       Deep maroon, saffron gold, warm orange, and forest green — inspired
+       by the vibrant costumes and stage of Yakshagana, Karnataka's
+       traditional theatre. The palette stays dark so it reads well on
+       phones in a dim ballroom. */
+    --gold: #F4B942;           /* saffron / gold ornament */
+    --gold-rgb: 244, 185, 66;
+    --gold-soft: #FCE8C6;      /* light saffron */
+    --gold-soft-rgb: 252, 232, 198;
+    --gold-dark: #C78A1E;
+    --leather: #6B1A1A;        /* deep maroon base */
+    --leather-rgb: 107, 26, 26;
+    --tan: #D67D4A;            /* warm orange accent */
+    --tan-rgb: 214, 125, 74;
+    --rust: #9E2B25;           /* deep red kireeta */
+    --rust-rgb: 158, 43, 37;
+    --turquoise: #2E8B57;      /* forest green costume accent */
+    --turquoise-rgb: 46, 139, 87;
     --mint: #92FE9D;
 
-    --ink: #140F0A;            /* dark tooled leather */
-    --surface: #241811;
-    --surface-2: #2E1C10;
-    --elevated: rgba(240, 220, 180, 0.05);
-    --elevated-strong: rgba(240, 220, 180, 0.10);
-    --border: rgba(240, 220, 180, 0.12);
-    --border-strong: rgba(240, 220, 180, 0.22);
+    --ink: #1A0A0A;            /* dark maroon-black */
+    --surface: #2A1010;
+    --surface-2: #3A1816;
+    --elevated: rgba(252, 232, 198, 0.05);
+    --elevated-strong: rgba(252, 232, 198, 0.10);
+    --border: rgba(252, 232, 198, 0.12);
+    --border-strong: rgba(252, 232, 198, 0.22);
 
-    --text: #F7EEE0;           /* warm cream, not white */
-    --text-rgb: 247, 238, 224;
-    --text-dim: rgba(247, 238, 224, 0.68);
-    --text-dimmer: rgba(247, 238, 224, 0.48);
+    --text: #FFF5E6;           /* warm cream, not white */
+    --text-rgb: 255, 245, 230;
+    --text-dim: rgba(255, 245, 230, 0.68);
+    --text-dimmer: rgba(255, 245, 230, 0.48);
 
     --ok: #22C55E;
     --ok-rgb: 34, 197, 94;
@@ -1574,7 +1573,7 @@ def brand_bar() -> str:
     """Slim sticky bar with the event name and a countdown pill. Renders once per page."""
     return (
         '<div class="brand-bar">'
-        f'<div class="brand-bar-title">🤠 {html.escape(config.EVENT_NAME)}</div>'
+        f'<div class="brand-bar-title">🎭 {html.escape(config.EVENT_NAME)}</div>'
         f'{countdown_pill()}'
         '</div>'
     )
@@ -1601,7 +1600,7 @@ def hero() -> str:
     theme_note = html.escape(getattr(config, "EVENT_THEME_NOTE", "") or "")
     if theme_name:
         note_html = f" <small>· {theme_note}</small>" if theme_note else ""
-        theme_html = f'<div class="hero-theme">🤠 {theme_name} Theme{note_html}</div>'
+        theme_html = f'<div class="hero-theme">🎭 {theme_name} Theme{note_html}</div>'
     else:
         theme_html = ""
 
@@ -1633,7 +1632,7 @@ def event_strip() -> str:
     """
     theme_name = html.escape(getattr(config, "EVENT_THEME", "") or "")
     theme_html = (
-        f'<span class="event-strip-theme">🤠 {theme_name} Theme</span>' if theme_name else ""
+        f'<span class="event-strip-theme">🎭 {theme_name} Theme</span>' if theme_name else ""
     )
     return (
         '<div class="event-strip">'
