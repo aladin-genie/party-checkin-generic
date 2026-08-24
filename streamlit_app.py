@@ -1710,6 +1710,36 @@ def page_admin():
                     st.error(f"Incorrect password. ({fail_count}/{ADMIN_MAX_ATTEMPTS} attempts)")
         return
 
+    # If the app fell back to SQLite, the organiser is the one who can fix it —
+    # show them WHY here rather than leaving the reason buried in Streamlit
+    # Cloud's server logs. Credentials are scrubbed in utils before this point.
+    try:
+        diag = utils.db_connection_diagnostics()
+    except Exception:
+        diag = {"using_fallback": False}
+    if diag.get("using_fallback"):
+        st.error(
+            "🗄️ **Not connected to Supabase — running on a temporary local database.** "
+            "Registrations are refused and nothing here will persist."
+        )
+        if diag.get("hint"):
+            st.warning(f"**Likely cause:** {diag['hint']}")
+        with st.expander("Connection error detail", expanded=False):
+            st.write(
+                {
+                    "host": diag.get("host") or "—",
+                    "port": diag.get("port") or "—",
+                    "driver": diag.get("driver") or "—",
+                    "failed at (UTC)": diag.get("when") or "—",
+                }
+            )
+            if diag.get("error"):
+                st.code(diag["error"])
+            st.caption(
+                "Fix DATABASE_URL in Streamlit Cloud → Settings → Secrets, then "
+                "Manage app → Reboot. Credentials are never shown here."
+            )
+
     if st.button("🔒 Logout", type="secondary"):
         st.session_state["admin_authenticated"] = False
         st.rerun()

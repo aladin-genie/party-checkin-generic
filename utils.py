@@ -269,6 +269,78 @@ def _get_engine_url_hash() -> str:
     return hashlib.sha256(db_url.encode("utf-8")).hexdigest()[:16]
 
 
+# The last DATABASE_URL connection failure, so the organiser can see WHY the
+# app fell back to SQLite without needing Streamlit Cloud's server logs.
+# Populated by _get_engine_cached(); read by db_connection_diagnostics().
+#
+# NEVER put the raw DSN in here — a psycopg2/pg8000 error can echo the
+# connection string back, password and all, and this is rendered in a page.
+# _scrub_dsn() strips credentials before anything is stored.
+_LAST_DB_ERROR = {"error": "", "host": "", "port": "", "driver": "", "when": ""}
+
+
+def _scrub_dsn(text: str) -> str:
+    """Remove any user:password@ pair from a string before it is displayed."""
+    out = re.sub(r"://[^/\s]*:[^/@\s]*@", "://***:***@", str(text or ""))
+    out = re.sub(r"(?i)(password\s*=\s*)\S+", r"\1***", out)
+    return out
+
+
+def _record_db_error(db_url: str, exc) -> None:
+    """Stash a scrubbed summary of a failed DATABASE_URL connection."""
+    host = port = driver = ""
+    try:
+        from sqlalchemy.engine import make_url
+        u = make_url(db_url)
+        host, port, driver = (u.host or ""), str(u.port or ""), (u.drivername or "")
+    except Exception:
+        pass
+    _LAST_DB_ERROR.update(
+        error=_scrub_dsn(exc)[:600], host=host, port=port, driver=driver,
+        when=_utc_now().isoformat(timespec="seconds"),
+    )
+
+
+def db_connection_diagnostics() -> dict:
+    """What went wrong reaching the configured database, for the organiser.
+
+    Returns {"using_fallback": bool, "error", "host", "port", "driver",
+    "when", "hint"}. Everything is scrubbed of credentials — this is
+    rendered in the Admin page.
+
+    `hint` turns the two failure modes this deployment actually hits into
+    plain instructions, because the raw driver error ("could not translate
+    host name", "connection timed out") does not tell an organiser what to
+    change. Supabase's DIRECT db.*.supabase.co host is IPv6-only and does
+    not resolve from Streamlit Cloud — the Pooler host is required. See
+    AGENTS.md.
+    """
+    host = _LAST_DB_ERROR.get("host", "") or ""
+    err = (_LAST_DB_ERROR.get("error", "") or "").lower()
+    hint = ""
+    if host.startswith("db.") and "supabase" in host:
+        hint = (
+            "DATABASE_URL points at Supabase's DIRECT host "
+            f"({host}). That host is IPv6-only and does not resolve from "
+            "Streamlit Cloud. Use the Session Pooler URL instead — it looks like "
+            "postgresql://postgres.<project-ref>:<password>@aws-0-<region>"
+            ".pooler.supabase.com:6543/postgres"
+        )
+    elif "translate host name" in err or "name or service not known" in err or "nodename nor servname" in err:
+        hint = ("The database host name did not resolve. Check DATABASE_URL for a typo, "
+                "and make sure you are using the Supabase Pooler host.")
+    elif "timeout" in err or "timed out" in err:
+        hint = ("The host resolved but never accepted the connection — usually a network/"
+                "firewall block, or a Supabase platform incident. Check status.supabase.com.")
+    elif "password" in err or "authentication" in err:
+        hint = "The credentials were rejected. Re-copy the password from Supabase into DATABASE_URL."
+    return {
+        "using_fallback": _using_fallback_db(),
+        "hint": hint,
+        **{k: _LAST_DB_ERROR.get(k, "") for k in ("error", "host", "port", "driver", "when")},
+    }
+
+
 # How long to wait for a Postgres connection before giving up.
 #
 # This MUST be set. Without it psycopg2 inherits the OS TCP timeout — well
@@ -353,9 +425,12 @@ def _get_engine_cached(_db_url_hash: str = ""):
                 print("DATABASE_URL connection via pg8000: OK")
                 return engine
             except Exception as e2:
-                print(f"pg8000 fallback also failed: {e2}")
-        # Log the failure without exposing the full URL in the UI
-        print(f"DATABASE_URL connection failed, falling back to SQLite: {e}")
+                print(f"pg8000 fallback also failed: {_scrub_dsn(e2)}")
+        # Log the failure without exposing the full URL in the UI, and stash a
+        # scrubbed copy so the Admin page can show the organiser what broke
+        # instead of making them dig through Streamlit Cloud's logs.
+        _record_db_error(db_url, e)
+        print(f"DATABASE_URL connection failed, falling back to SQLite: {_scrub_dsn(e)}")
         fallback_url = "sqlite:///party_guests.db"
         return create_engine(fallback_url, echo=False)
 

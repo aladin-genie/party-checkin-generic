@@ -4326,5 +4326,59 @@ def run_tests():
         return 1
 
 
+
+class TestDbConnectionDiagnostics(unittest.TestCase):
+    """The organiser-facing "why did it fall back to SQLite" panel.
+
+    This text is rendered in the Admin page, so the one thing it must never
+    do is echo the DATABASE_URL password back onto a screen — psycopg2 and
+    pg8000 both happily include the connection string in their errors.
+    """
+
+    def test_scrub_dsn_strips_user_and_password(self):
+        dirty = "could not connect to postgresql://postgres.abc:hunter2@host:5432/db"
+        clean = utils._scrub_dsn(dirty)
+        self.assertNotIn("hunter2", clean)
+        self.assertIn("***:***@", clean)
+
+    def test_scrub_dsn_strips_keyword_password_form(self):
+        self.assertNotIn("hunter2", utils._scrub_dsn("dbname=x password=hunter2 host=y"))
+
+    def test_record_db_error_never_stores_the_password(self):
+        secret = "s3cr3t-p4ss"
+        url = f"postgresql+psycopg2://postgres.ref:{secret}@db.example.supabase.co:5432/postgres"
+        utils._record_db_error(url, Exception(f"connection failed for {url}"))
+        blob = repr(utils.db_connection_diagnostics())
+        self.assertNotIn(secret, blob)
+
+    def test_record_db_error_captures_host_port_and_driver(self):
+        utils._record_db_error(
+            "postgresql+psycopg2://u:p@db.example.supabase.co:5432/postgres", Exception("boom")
+        )
+        diag = utils.db_connection_diagnostics()
+        self.assertEqual(diag["host"], "db.example.supabase.co")
+        self.assertEqual(diag["port"], "5432")
+        self.assertIn("psycopg2", diag["driver"])
+
+    def test_direct_supabase_host_gets_the_pooler_hint(self):
+        # The failure this deployment actually hits: Supabase's direct host is
+        # IPv6-only and doesn't resolve from Streamlit Cloud (see AGENTS.md).
+        utils._record_db_error(
+            "postgresql+psycopg2://u:p@db.abc123.supabase.co:5432/postgres", Exception("timeout")
+        )
+        hint = utils.db_connection_diagnostics()["hint"]
+        self.assertIn("Pooler", hint)
+        self.assertIn("pooler.supabase.com", hint)
+
+    def test_pooler_host_does_not_get_the_direct_host_hint(self):
+        utils._record_db_error(
+            "postgresql+psycopg2://u:p@aws-0-us-east-1.pooler.supabase.com:6543/postgres",
+            Exception("password authentication failed"),
+        )
+        hint = utils.db_connection_diagnostics()["hint"]
+        self.assertNotIn("IPv6", hint)
+        self.assertIn("credentials", hint.lower())
+
+
 if __name__ == "__main__":
     sys.exit(run_tests())
