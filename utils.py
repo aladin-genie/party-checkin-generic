@@ -1194,6 +1194,15 @@ def ticket_availability() -> dict:
     "unlimited": bool}. `remaining` is clamped at 0 so an over-sold table
     (cap lowered after the fact) never renders a negative count.
 
+    `sold` stays PAID tickets only (tickets_sold()), matching its name and
+    keeping this dict's contract stable for existing callers/tests. But
+    `cap` is the venue's total physical-seat count, and FREE child seats
+    (config.is_free_kid_seat()) occupy real seats too without ever showing
+    up in `sold` — so `remaining`/`sold_out` are computed against
+    tickets_sold() + kid_tickets_sold(), the same total register_guest()'s
+    real oversell guard checks, or "N remaining" would overstate how many
+    seats are actually left once any free child seats are registered.
+
     Must never raise: this is read on the Home and Register render paths, so
     a DB blip falls back to "unlimited" (cap unknown → nothing shown, form
     stays open) rather than wrongly telling guests the party is sold out.
@@ -1215,11 +1224,12 @@ def ticket_availability() -> dict:
         if cap <= 0:
             return {"cap": 0, "sold": 0, "remaining": 0, "sold_out": False, "unlimited": True}
         sold = tickets_sold()
+        occupied = sold + kid_tickets_sold()
         return {
             "cap": cap,
             "sold": sold,
-            "remaining": max(0, cap - sold),
-            "sold_out": sold >= cap,
+            "remaining": max(0, cap - occupied),
+            "sold_out": occupied >= cap,
             "unlimited": False,
         }
     except Exception as e:
@@ -1796,6 +1806,7 @@ def _build_qr_email_message(
     plus_one_name: str,
     qr_code: str,
     seat_numbers: str = "",
+    kid_seat_numbers: str = "",
 ) -> MIMEMultipart:
     """Build the multipart QR-code email (HTML + plain-text + inline image).
 
@@ -1810,6 +1821,12 @@ def _build_qr_email_message(
     (config.format_seat_labels(), e.g. "A3, A4, B7") they saw on the seat
     map rather than the raw stored integers. Blank for a legacy booking with
     no seats on file, in which case the line is omitted entirely.
+
+    `kid_seat_numbers` is the comma-joined FREE child seats (Guest.
+    kid_seat_numbers / guest["kid_seat_numbers"]) — a separate, optional
+    line right after the paid seats line, in both bodies, so a family
+    actually sees their child's seat in the confirmation email instead of
+    only the paid seats. Blank omits the line, same as `seat_numbers`.
     """
     qr_image = generate_qr_image(qr_code)
 
@@ -1820,6 +1837,10 @@ def _build_qr_email_message(
     seats = seat_numbers_list(seat_numbers)
     seats_text = f"🪑 Seats: {config.format_seat_labels(seats)}" if seats else ""
     safe_seats_text = html.escape(seats_text)
+
+    kid_seats = kid_seat_numbers_list(kid_seat_numbers)
+    kid_seats_text = f"🧒 Free child seats: {config.format_seat_labels(kid_seats)}" if kid_seats else ""
+    safe_kid_seats_text = html.escape(kid_seats_text)
 
     # plus_one_name holds every additional guest, newline-joined — rendering
     # it as one escaped blob would run all the names together on a single
@@ -1860,6 +1881,7 @@ def _build_qr_email_message(
     <p>You're registered for <strong>{html.escape(event_title)} — {html.escape(config.EVENT_TAGLINE)}!</strong></p>
     <p>🎫 Tickets: {ticket_count}</p>
     {"<p>" + safe_seats_text + "</p>" if seats_text else ""}
+    {"<p>" + safe_kid_seats_text + "</p>" if kid_seats_text else ""}
     {plus_one_line}
     <p>📅 Date: {html.escape(config.EVENT_DATE_TEXT)}<br>
        🕕 Time: {html.escape(config.EVENT_TIME_TEXT)}<br>
@@ -1882,6 +1904,7 @@ You're registered for {event_title} — {config.EVENT_TAGLINE}!
 
 🎫 Tickets: {ticket_count}
 {seats_text}
+{kid_seats_text}
 {plus_one_text}
 📅 Date: {config.EVENT_DATE_TEXT}
 🕕 Time: {config.EVENT_TIME_TEXT}
@@ -1958,6 +1981,7 @@ def send_qr_email(guest) -> bool:
         guest.plus_one_name,
         guest.qr_code,
         getattr(guest, "seat_numbers", ""),
+        getattr(guest, "kid_seat_numbers", ""),
     )
     return _smtp_send(secrets["mail_server"], secrets["mail_port"], secrets["mail_username"], secrets["mail_password"], msg)
 
@@ -1992,6 +2016,7 @@ def send_qr_email_async(guest: dict) -> None:
     phone = guest.get("phone", "")
     zelle_ref = guest.get("zelle_ref", "")
     seat_numbers = guest.get("seat_numbers", "")
+    kid_seat_numbers = guest.get("kid_seat_numbers", "")
 
     def _worker():
         error_text = ""
@@ -1999,7 +2024,7 @@ def send_qr_email_async(guest: dict) -> None:
             msg = _build_qr_email_message(
                 secrets["mail_sender"], guest_id, guest_name, guest_email,
                 ticket_count, plus_one_name, qr_code,
-                seat_numbers,
+                seat_numbers, kid_seat_numbers,
             )
             sent = _smtp_send(
                 secrets["mail_server"], secrets["mail_port"],

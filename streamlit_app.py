@@ -572,6 +572,7 @@ def _render_registration_confirmation() -> None:
             guest["ticket_count"],
             utils.guest_names_list(guest.get("plus_one_name")),
             guest.get("seats", []),
+            kid_seat_numbers=guest.get("kid_seats", []),
         ),
         unsafe_allow_html=True,
     )
@@ -633,7 +634,7 @@ def page_register():
     # so stale values don't appear when re-entering the page or clicking "Register Another".
     if st.session_state.get("reset_register_form"):
         for _key in ("reg_name", "reg_email", "reg_phone", "reg_plus_one", "reg_zelle", "ticket_count",
-                     "selected_seats"):
+                     "selected_seats", "selected_kid_seats"):
             st.session_state.pop(_key, None)
         st.session_state["reg_agree"] = False
         st.session_state["reg_errors"] = {}
@@ -701,7 +702,10 @@ def page_register():
     pruned = sorted(s for s in previously_selected if s not in still_available)
     if pruned:
         st.session_state["selected_seats"] = [s for s in previously_selected if s in still_available]
-        pruned_label = ", ".join(str(s) for s in pruned)
+        # Label, not the raw stored integer: the guest picked "B3" and the
+        # seat map says "B3", so telling them "Seat 13 was just booked" reads
+        # as a different seat entirely.
+        pruned_label = config.format_seat_labels(pruned)
         st.warning(
             f"Seat{'s' if len(pruned) != 1 else ''} {pruned_label} "
             f"{'were' if len(pruned) != 1 else 'was'} just booked by someone else and "
@@ -716,6 +720,11 @@ def page_register():
     if len(current_selection) > max_tickets:
         st.session_state["selected_seats"] = current_selection[:max_tickets]
     st.session_state.setdefault("selected_seats", [])
+
+    # Read once, early, so both the paid- and kid-seat error rendering below
+    # (each next to its own picker) can use it without re-reading session
+    # state or duplicating the fetch.
+    reg_errors = st.session_state.get("reg_errors", {})
 
     # ── Zelle Payment Info Card ────────────────────────────────────────────
     # Has to render BEFORE the seat picker (that's where Step 1 belongs on
@@ -789,23 +798,84 @@ def page_register():
              f"{config.seat_pricing_summary()} Kids under 12 are free. "
              "The total updates automatically as you pick.",
     )
+    if "seat_numbers" in reg_errors:
+        st.markdown(theme.field_error(reg_errors["seat_numbers"]), unsafe_allow_html=True)
+
+    # ── Free child seat selection ───────────────────────────────────────────
+    # Same stale-value hazard as the paid picker above — a seat can be sold
+    # to someone else, or picked as a paid seat on this very booking, while
+    # this page is open — so anything no longer eligible must be pruned OUT
+    # of session_state["selected_kid_seats"] BEFORE the widget below is
+    # instantiated, or Streamlit raises. Copies the paid-seat prune pattern
+    # above exactly.
+    kid_eligible = set(config.free_kid_seat_numbers()) & still_available
+    kid_available = kid_eligible - set(selected_seats)
+
+    previously_selected_kids = list(st.session_state.get("selected_kid_seats", []))
+    pruned_kids = sorted(s for s in previously_selected_kids if s not in kid_available)
+    if pruned_kids:
+        st.session_state["selected_kid_seats"] = [
+            s for s in previously_selected_kids if s in kid_available
+        ]
+        pruned_kids_label = config.format_seat_labels(pruned_kids)
+        st.warning(
+            f"Free child seat{'s' if len(pruned_kids) != 1 else ''} {pruned_kids_label} "
+            f"{'are' if len(pruned_kids) != 1 else 'is'} no longer available — removed from "
+            "your selection, please pick again."
+        )
+
+    max_kids = config.MAX_KIDS_PER_REGISTRATION
+    current_kid_selection = list(st.session_state.get("selected_kid_seats", []))
+    if len(current_kid_selection) > max_kids:
+        st.session_state["selected_kid_seats"] = current_kid_selection[:max_kids]
+    st.session_state.setdefault("selected_kid_seats", [])
+
+    # `options` mirrors option_seats above: available free-tier seats plus
+    # whatever the guest already has picked, so their own pick can never
+    # vanish even if this ever runs a beat behind the prune above.
+    kid_option_seats = sorted(kid_available | set(st.session_state.get("selected_kid_seats", [])))
+
+    def _kid_seat_option_label(seat):
+        return f"{config.seat_label(seat)} · Free"
+
+    selected_kid_seats = st.multiselect(
+        f"Free Child Seats — under 12, {config.free_kid_seat_range_label()} only",
+        options=kid_option_seats,
+        format_func=_kid_seat_option_label,
+        key="selected_kid_seats",
+        max_selections=max_kids,
+        help=config.KIDS_POLICY_TEXT,
+    )
+    if "kid_seat_numbers" in reg_errors:
+        st.markdown(theme.field_error(reg_errors["kid_seat_numbers"]), unsafe_allow_html=True)
 
     # Cinema-style visual map so guests see exactly which seats cost what,
-    # which are already taken, and which ones are theirs.
-    st.markdown(theme.seat_map(selected_seats, seat_avail["taken"]), unsafe_allow_html=True)
+    # which are already taken, and which ones are theirs (paid or kid).
+    st.markdown(
+        theme.seat_map(selected_seats, seat_avail["taken"], kid_selected=selected_kid_seats),
+        unsafe_allow_html=True,
+    )
     st.markdown(theme.seat_breakdown(selected_seats), unsafe_allow_html=True)
 
     ticket_count = len(selected_seats)
     total_cents = config.seats_total_cents(selected_seats)
 
-    # The exact amount the guest is about to Zelle.
-    st.markdown(theme.total_card(ticket_count, total_cents), unsafe_allow_html=True)
+    # The exact amount the guest is about to Zelle — kid seats are always
+    # $0 and never enter total_cents (see config.seats_total_cents, which is
+    # PAID-seats only).
+    st.markdown(
+        theme.total_card(ticket_count, total_cents, kid_seats=selected_kid_seats),
+        unsafe_allow_html=True,
+    )
 
-    reg_errors = st.session_state.get("reg_errors", {})
-    if "seat_numbers" in reg_errors:
-        st.markdown(theme.field_error(reg_errors["seat_numbers"]), unsafe_allow_html=True)
     if ticket_count == 0:
-        st.info("👆 Pick at least one seat to continue — a booking needs at least one seat.")
+        if selected_kid_seats:
+            st.info(
+                "👆 A child can't book alone — pick at least one paid seat above to go with "
+                "the free child seat you selected."
+            )
+        else:
+            st.info("👆 Pick at least one seat to continue — a booking needs at least one seat.")
 
     # How many other people this booking has to name, stated before the field
     # rather than after a rejected submit. Lives outside the form alongside
@@ -940,6 +1010,7 @@ def page_register():
             name, email, phone, plus_one_name, zelle_ref, agree_terms,
             ticket_count=ticket_count,
             seat_numbers=selected_seats,
+            kid_seat_numbers=selected_kid_seats,
         )
 
         if errors:
@@ -954,6 +1025,7 @@ def page_register():
                 status="validation_error",
                 errors="; ".join(errors.values()),
                 seat_numbers=cleaned["seat_numbers_str"],
+                kid_seat_numbers=cleaned["kid_seat_numbers_str"],
             )
             st.rerun()
 
@@ -966,6 +1038,7 @@ def page_register():
             cleaned["plus_one_name"],
             cleaned["zelle_ref"],
             seat_numbers=cleaned["seat_numbers"],
+            kid_seat_numbers=cleaned["kid_seat_numbers"],
         )
 
         if result["ok"]:
@@ -985,6 +1058,7 @@ def page_register():
                 status="registered",
                 guest_id=guest["id"],
                 seat_numbers=cleaned["seat_numbers_str"],
+                kid_seat_numbers=cleaned["kid_seat_numbers_str"],
             )
             _cached_stats.clear()
             _cached_site_stats.clear()
@@ -1004,6 +1078,7 @@ def page_register():
                 status=reason,
                 errors=result["message"],
                 seat_numbers=cleaned["seat_numbers_str"],
+                kid_seat_numbers=cleaned["kid_seat_numbers_str"],
             )
             if reason == "duplicate_email":
                 st.session_state["reg_errors"] = {"email": result["message"]}
@@ -1015,11 +1090,17 @@ def page_register():
                 # that actually matters here. Refresh the cache, drop only
                 # the conflicting seats (keep the rest of the pick and every
                 # other field the guest already filled in), and let them
-                # re-pick rather than losing the whole form.
+                # re-pick rather than losing the whole form. "taken" covers
+                # BOTH paid and kid seats (see utils.register_guest), so both
+                # selections must be pruned or the kid picker could keep a
+                # seat that was just sold out from under it.
                 _cached_seat_availability.clear()
                 conflict = set(result.get("taken") or [])
                 st.session_state["selected_seats"] = [
                     s for s in st.session_state.get("selected_seats", []) if s not in conflict
+                ]
+                st.session_state["selected_kid_seats"] = [
+                    s for s in st.session_state.get("selected_kid_seats", []) if s not in conflict
                 ]
                 _set_flash("error", result["message"])
                 st.rerun()
@@ -2031,6 +2112,7 @@ def _admin_guests_tab():
                 "Phone": g["phone"] or "—",
                 "Tickets": g["ticket_count"],
                 "Seats": config.format_seat_labels(g["seats"]) or "—",
+                "Kid Seats": config.format_seat_labels(g.get("kid_seats", [])) or "—",
                 "Party Size": utils.party_size(g),
                 "Names": utils.guest_name_count(g["plus_one_name"]),
                 "Additional Guests": (g["plus_one_name"] or "").replace("\n", ", ") or "—",
@@ -2060,6 +2142,10 @@ def _admin_guests_tab():
             # If seats ever need to change, do it through a new booking, not
             # a hand edit in this grid.
             "Seats": st.column_config.TextColumn("Seats", help="Booked seat labels (row + number). Read-only here — edits could silently double-book a seat."),
+            # Read-only for the same reason as Seats above: apply_guest_changes()
+            # has no seat validation, so an editable cell here could silently
+            # double-book a free child seat too.
+            "Kid Seats": st.column_config.TextColumn("Kid Seats", help="Free child seat labels (row + number). Read-only here — edits could silently double-book a seat."),
             "Party Size": st.column_config.NumberColumn(
                 "Party Size", help="Total people on this booking, including the person who registered."
             ),
@@ -2073,7 +2159,7 @@ def _admin_guests_tab():
             "Band Given": st.column_config.CheckboxColumn("Band Given", help="Tick once their wristband is on."),
             "Delete": st.column_config.CheckboxColumn("Delete", help="Tick then Save changes — a confirmation step follows."),
         },
-        disabled=["id", "Name", "Email", "Phone", "Tickets", "Seats", "Party Size", "Names", "Additional Guests"],
+        disabled=["id", "Name", "Email", "Phone", "Tickets", "Seats", "Kid Seats", "Party Size", "Names", "Additional Guests"],
     )
 
     if st.button("💾 Save changes", type="primary", use_container_width=True, key="admin_save_changes"):

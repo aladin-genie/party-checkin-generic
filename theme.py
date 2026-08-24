@@ -1278,6 +1278,14 @@ a.sponsor-card:hover {
     font-size: 0.88rem;
     color: var(--text-dim);
 }
+/* Deliberately NOT gold — the total-value above is the only money on this
+   card, and free child seats must never look like they're part of it. */
+.total-kid-note {
+    margin-top: var(--space-2);
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--text-dim);
+}
 
 /* ── Cinema-style seat map ─────────────────────────────────────────────── */
 /* Purely visual: the slider above it drives the actual selection. The map
@@ -1346,6 +1354,7 @@ a.sponsor-card:hover {
     background: rgba(var(--gold-rgb), 0.18);
     border: 1px solid rgba(var(--gold-rgb), 0.35);
     box-shadow: inset 0 -2px 0 rgba(0, 0, 0, 0.2);
+    position: relative;
 }
 /* Aisle gap: every 5th seat gets extra right margin to create a center aisle. */
 .seat.aisle {
@@ -1366,6 +1375,39 @@ a.sponsor-card:hover {
 .seat.selected {
     box-shadow: 0 0 0 2px var(--text), 0 0 12px rgba(var(--gold-rgb), 0.55);
     color: #000;
+}
+/* FREE CHILD SEAT: this guest's own kid seat — a distinct accent (rust glow
+   instead of the paid-seat gold glow) plus a small marker, so it can never
+   be mistaken for a paid `.selected` seat at a glance. Bare classes (not
+   `.seat.kid-seat`) so the same rule styles both the 26px seat cell and its
+   14px legend swatch, matching how .seat-taken/.seat-gold etc. already
+   double as legend classes. Reuses --rust — unused elsewhere on this map —
+   rather than adding a new palette token. */
+.kid-seat {
+    box-shadow: 0 0 0 2px var(--text), 0 0 10px rgba(var(--rust-rgb), 0.65);
+    color: #000;
+}
+.kid-seat::after {
+    content: "🧒";
+    position: absolute;
+    top: -7px;
+    right: -6px;
+    font-size: 9px;
+    line-height: 1;
+    filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.6));
+}
+.seat-dot.kid-seat::after {
+    top: -5px;
+    right: -5px;
+    font-size: 7px;
+}
+/* FREE-ELIGIBLE ZONE: subtly ring the cheapest tier's cells (and its legend
+   swatch) even before anything is picked, so guests can see where a child
+   may sit free without it reading as an actual selection. Only ever applied
+   to an otherwise-AVAILABLE cell — taken/selected/kid-seat cells never carry
+   this class, so a seat still renders in exactly one primary state. */
+.free-zone {
+    box-shadow: inset 0 0 0 1px rgba(var(--rust-rgb), 0.55);
 }
 /* TAKEN: visibly unavailable, not just "a different tier" — muted, flat,
    dashed border, reduced opacity, and the pointer says "no" too. */
@@ -1396,6 +1438,7 @@ a.sponsor-card:hover {
     width: 14px;
     height: 14px;
     border-radius: 4px 4px 6px 6px;
+    position: relative;
 }
 .seat-count {
     font-size: 0.85rem;
@@ -2464,7 +2507,7 @@ def sponsor_wall(sponsors: list) -> str:
 
 def registration_confirmation(
     name: str, email: str, tickets: int, guest_names: list,
-    seat_numbers=None,
+    seat_numbers=None, kid_seat_numbers=None,
 ) -> str:
     """The "you're in" card shown at the top of Home right after a submit.
 
@@ -2477,11 +2520,17 @@ def registration_confirmation(
     The QR email is fire-and-forget (utils.send_qr_email_async), so the
     wording here says it is on its way, never that it arrived (see PART 1).
 
-    `seat_numbers` is the guest's actual held seats (e.g. guest["seats"], a
-    list of ints) — this is the guest's receipt, so it must say which seats
-    they hold, in the venue-style labels (config.seat_label()) they picked
-    on the seat map — not the raw stored integers. Omitted (or empty) skips
-    the row, matching a legacy booking with no seat numbers on file.
+    `seat_numbers` is the guest's actual held PAID seats (e.g.
+    guest["seats"], a list of ints) — this is the guest's receipt, so it
+    must say which seats they hold, in the venue-style labels
+    (config.seat_label()) they picked on the seat map — not the raw stored
+    integers. Omitted (or empty) skips the row, matching a legacy booking
+    with no seat numbers on file.
+
+    `kid_seat_numbers` is the guest's FREE child seats (e.g.
+    guest["kid_seats"]) — a separate, optional row so a family can see their
+    child's seat was actually held, not silently dropped. Defaults to None
+    (no row) so existing callers that pass nothing keep working unchanged.
     """
     try:
         tickets = int(tickets)
@@ -2498,12 +2547,25 @@ def registration_confirmation(
             continue
     seats = sorted(set(seats))
 
+    kid_seats = []
+    for s in (kid_seat_numbers or []):
+        try:
+            kid_seats.append(int(s))
+        except (TypeError, ValueError):
+            continue
+    kid_seats = sorted(set(kid_seats))
+
     rows = [
         ("Tickets", f"{tickets} ticket{plural}"),
         ("QR code emailed to", email or "—"),
     ]
     if seats:
         rows.insert(1, ("Seats", config.format_seat_labels(seats)))
+    if kid_seats:
+        # Right after the paid seats (or at the top if this booking has
+        # none), so the whole party's seating reads as one block.
+        insert_at = 2 if seats else 1
+        rows.insert(insert_at, ("Free child seats", config.format_seat_labels(kid_seats)))
     if guest_names:
         rows.append((f"Additional guests ({len(guest_names)})", ", ".join(guest_names)))
         rows.append(("On this booking", f"{len(guest_names) + 1} people, including you"))
@@ -2663,24 +2725,52 @@ def seat_policy_chips() -> str:
     )
 
 
-def total_card(tickets: int, total_cents: int) -> str:
+def total_card(tickets: int, total_cents: int, kid_seats=None) -> str:
     """The live-updating 'Total to Pay' card on the Register page.
 
-    `total_cents` is the exact amount to Zelle for the selected seats. There
-    is no savings/discount line: seats are picked individually now (see
-    config.seats_total_cents), so a guest's total is simply the sum of the
-    specific seats they hold — there is no "vs base price" comparison that
-    means anything for an arbitrary pick, and no screen may claim a discount
-    that isn't real.
+    `total_cents` is the exact amount to Zelle for the selected PAID seats —
+    it never includes `kid_seats` (config.is_free_kid_seat() territory: a
+    child seat is $0, see AGENTS.md's kids-ticket rule). There is no
+    savings/discount line for the paid seats either: seats are picked
+    individually now (see config.seats_total_cents), so a guest's total is
+    simply the sum of the specific seats they hold — there is no "vs base
+    price" comparison that means anything for an arbitrary pick, and no
+    screen may claim a discount that isn't real.
+
+    `kid_seats` is optional and defaults to None (no row rendered) so
+    existing callers that pass nothing keep working unchanged. When given, a
+    clear non-money line is added below the total — e.g. "+ 2 free child
+    seats (J4, J5)" — so nobody reading just the big dollar figure thinks
+    the kids were undercharged or dropped from the booking.
     """
     tickets = int(tickets)
     total = total_cents / 100
     plural = "s" if tickets != 1 else ""
+
+    kid_clean = []
+    for s in (kid_seats or []):
+        try:
+            kid_clean.append(int(s))
+        except (TypeError, ValueError):
+            continue
+    kid_clean = sorted(set(kid_clean))
+
+    kid_note = ""
+    if kid_clean:
+        kid_plural = "s" if len(kid_clean) != 1 else ""
+        kid_labels = html.escape(config.format_seat_labels(kid_clean))
+        kid_note = (
+            '<div class="total-kid-note">'
+            f'🧒 + {len(kid_clean)} free child seat{kid_plural} ({kid_labels})'
+            '</div>'
+        )
+
     return f"""
     <div class="total-card">
         <div class="total-label">Total to Pay</div>
         <div class="total-value">${total:,.2f}</div>
         <div class="total-caption">{tickets} seat{plural} selected</div>
+        {kid_note}
     </div>
     """
 
@@ -2712,17 +2802,21 @@ def next_tier_nudge(ticket_count: int, tier: dict, base_price_cents: int) -> str
     )
 
 
-def seat_map(selected=(), taken=(), max_seats: int = None) -> str:
+def seat_map(selected=(), taken=(), kid_selected=(), max_seats: int = None) -> str:
     """Visual sanctuary-style seat map: every seat renders in exactly one of
-    three states — TAKEN (already booked by someone else), SELECTED (this
-    guest's own pick), or AVAILABLE (tier-coloured, open to pick).
+    FOUR states — TAKEN (already booked by someone else), KID (this guest's
+    own FREE child seat), SELECTED (this guest's own paid pick), or
+    AVAILABLE (tier-coloured, open to pick).
 
-    `selected` is the seat numbers this guest currently has chosen;
-    `taken` is every seat number already sold to someone else (see
-    utils.seat_availability()). `max_seats` defaults to config.TOTAL_SEATS.
-    Seats are colour-coded by price tier via config.seat_tier_index(), so the
-    map can never drift from config.SEAT_TIERS. The map is purely visual —
-    the actual selection happens via the multiselect above it.
+    `selected` is the PAID seat numbers this guest currently has chosen;
+    `kid_selected` is this guest's own FREE child seats (config.is_free_kid_
+    seat() territory — see AGENTS.md's kids-ticket rule); `taken` is every
+    seat number already sold to someone else, paid or kid, across every OTHER
+    booking (see utils.seat_availability(), which already folds kid seats
+    into it). `max_seats` defaults to config.TOTAL_SEATS. Seats are
+    colour-coded by price tier via config.seat_tier_index(), so the map can
+    never drift from config.SEAT_TIERS. The map is purely visual — the
+    actual selection happens via the multiselects above it.
 
     Each row starts with a row-letter gutter (config.seat_row_label()) so the
     grid reads like a real venue seating chart, and every seat cell shows its
@@ -2730,9 +2824,16 @@ def seat_map(selected=(), taken=(), max_seats: int = None) -> str:
     bare stored integer — that raw integer stays the DB/internal identity,
     this is display only.
 
-    A seat can never render as both taken and selected: if the two sets
-    somehow overlap (e.g. a stale selection the caller hasn't pruned yet),
-    TAKEN wins — real inventory outranks a page that hasn't caught up yet.
+    A seat can never render in two states at once. Precedence, highest wins:
+    TAKEN > KID > SELECTED > AVAILABLE. If the sets somehow overlap (e.g. a
+    stale selection the caller hasn't pruned yet), real inventory (TAKEN)
+    always outranks anything the page itself has picked, and a kid pick
+    outranks a stale paid pick of the same seat.
+
+    Before anything is picked, the free-eligible ZONE itself (every seat
+    config.is_free_kid_seat() allows) is marked with a subtle ring — see the
+    `.free-zone` CSS class — so guests can see where a child may sit free
+    without having to pick first.
     """
     import config as _config
 
@@ -2756,9 +2857,20 @@ def seat_map(selected=(), taken=(), max_seats: int = None) -> str:
         return cleaned
 
     taken_set = _clean(taken)
-    selected_set = _clean(selected) - taken_set
+    kid_set = _clean(kid_selected) - taken_set
+    selected_set = _clean(selected) - taken_set - kid_set
 
     tier_colors = ["gold", "tan", "turquoise"]
+
+    # The cheapest tier's colour class, for the free-zone/kid-seat legend
+    # swatches — computed from config rather than hardcoded, so it tracks
+    # SEAT_TIERS if the tiers are ever reordered.
+    free_kid_seats = _config.free_kid_seat_numbers()
+    if free_kid_seats:
+        free_tier_idx = _config.seat_tier_index(free_kid_seats[0])
+        free_cls = tier_colors[free_tier_idx % len(tier_colors)] if free_tier_idx >= 0 else ""
+    else:
+        free_cls = ""
 
     cols = getattr(_config, "SEAT_COLS", 10) or 10
     try:
@@ -2780,6 +2892,12 @@ def seat_map(selected=(), taken=(), max_seats: int = None) -> str:
                 f'aria-label="Seat {label} — already booked" '
                 f'title="Seat {label} — already booked"><span>{label}</span></div>'
             )
+        elif seat in kid_set:
+            cells.append(
+                f'<div class="seat seat-{cls} kid-seat{aisle}" '
+                f'aria-label="Seat {label} — your free child seat" '
+                f'title="Seat {label} — free child seat"><span>{label}</span></div>'
+            )
         elif seat in selected_set:
             cells.append(
                 f'<div class="seat seat-{cls} selected{aisle}" '
@@ -2788,8 +2906,9 @@ def seat_map(selected=(), taken=(), max_seats: int = None) -> str:
             )
         else:
             price = _config.seat_price_cents(seat) / 100
+            free_zone = " free-zone" if _config.is_free_kid_seat(seat) else ""
             cells.append(
-                f'<div class="seat seat-{cls}{aisle}" '
+                f'<div class="seat seat-{cls}{free_zone}{aisle}" '
                 f'aria-label="Seat {label} — ${price:,.2f}, available" '
                 f'title="Seat {label} — ${price:,.2f}"><span>{label}</span></div>'
             )
@@ -2817,16 +2936,34 @@ def seat_map(selected=(), taken=(), max_seats: int = None) -> str:
         '<span>Taken</span>'
         '</div>'
     )
+    if free_kid_seats:
+        range_label = html.escape(_config.free_kid_seat_range_label())
+        legend_items.append(
+            '<div class="seat-legend-item">'
+            f'<div class="seat-dot seat-{free_cls} free-zone"></div>'
+            f'<span>{range_label}: free for under-12s</span>'
+            '</div>'
+        )
+        legend_items.append(
+            '<div class="seat-legend-item">'
+            f'<div class="seat-dot seat-{free_cls} kid-seat"></div>'
+            "<span>Your child's free seat</span>"
+            '</div>'
+        )
 
-    still_available = max(0, max_seats - len(taken_set) - len(selected_set))
+    still_available = max(0, max_seats - len(taken_set) - len(selected_set) - len(kid_set))
     plural = "s" if len(selected_set) != 1 else ""
+    kid_note = ""
+    if kid_set:
+        kid_plural = "s" if len(kid_set) != 1 else ""
+        kid_note = f" + {len(kid_set)} free child seat{kid_plural}"
 
     return f"""
     <div class="seat-map-wrap">
         <div class="seat-screen">🙏 Altar</div>
         <div class="seat-grid">{grid}</div>
         <div class="seat-legend">{''.join(legend_items)}</div>
-        <div class="seat-count">{len(selected_set)} seat{plural} selected · {still_available} still available</div>
+        <div class="seat-count">{len(selected_set)} seat{plural} selected{kid_note} · {still_available} still available</div>
         <div class="seat-note">
             These seats are <strong>reserved to your booking</strong> once you submit — greyed-out
             seats are already booked by someone else. Choose any open seat.
@@ -3193,8 +3330,18 @@ def guest_identity_card(guest: dict, bands: int, status_label: str, status: str 
         ("Phone", guest.get("phone") or "— (registered before phone was required)", False),
         ("Tickets", str(tickets), True),
         ("Seats", seats_value, True),
-        ("Wristbands", str(bands), True),
     ]
+
+    # FREE under-12 child seats (config.is_free_kid_seat() territory) — a
+    # separate set from "seats" above and not counted in `tickets`, but door
+    # staff still need to see them: they're real people standing at the
+    # door with the rest of the party. Only shown when present, like the
+    # "Additional guests" row below.
+    kid_seats = sorted(int(s) for s in (guest.get("kid_seats") or []))
+    if kid_seats:
+        rows.append(("Child seats (free)", config.format_seat_labels(kid_seats), True))
+
+    rows.append(("Wristbands", str(bands), True))
 
     # Names are collected at registration, one per ticket beyond the booker
     # (see utils.additional_guests_expected), so door staff can read the

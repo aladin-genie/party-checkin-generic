@@ -687,6 +687,33 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertFalse(availability["sold_out"])
         self.assertFalse(availability["unlimited"])
 
+    def test_ticket_availability_remaining_accounts_for_kid_seats(self):
+        """FREE child seats occupy real inventory (register_guest()'s actual
+        oversell guard already adds them in — see kid_tickets_sold()) but
+        never show up in tickets_sold(), so "remaining" must subtract them
+        too or it overstates how many seats are actually left."""
+        self._register(name="Kid Fam", email="kidfam@test.com", ticket_count=3,
+                       zelle_ref="ZELLE-KIDFAM01", seat_numbers=[1, 2, 3],
+                       kid_seat_numbers=[90, 91])
+        with patch.object(config, "max_total_tickets", return_value=10):
+            availability = utils.ticket_availability()
+        # "sold" stays PAID tickets only — the return-key contract/meaning
+        # is unchanged.
+        self.assertEqual(availability["sold"], 3)
+        # But remaining must reflect the 2 occupied kid seats too:
+        # 10 - (3 paid + 2 kid) = 5, not 10 - 3 = 7.
+        self.assertEqual(availability["remaining"], 5)
+        self.assertFalse(availability["sold_out"])
+
+    def test_ticket_availability_sold_out_when_kid_seats_fill_the_last_capacity(self):
+        self._register(name="Kid Fam Full", email="kidfamfull@test.com", ticket_count=3,
+                       zelle_ref="ZELLE-KIDFULL1", seat_numbers=[1, 2, 3],
+                       kid_seat_numbers=[90, 91])
+        with patch.object(config, "max_total_tickets", return_value=5):
+            availability = utils.ticket_availability()
+        self.assertEqual(availability["remaining"], 0)
+        self.assertTrue(availability["sold_out"])
+
     def test_ticket_availability_sold_out_at_exactly_the_cap(self):
         self._register(name="Exact", email="exact@test.com", ticket_count=5,
                        zelle_ref="ZELLE-EXACT111")
@@ -1553,6 +1580,43 @@ class TestPartyCheckIn(unittest.TestCase):
         html_part = next(p for p in sent_msg.walk() if p.get_content_type() == "text/html")
         self.assertNotIn("Seats:", html_part.get_payload(decode=True).decode("utf-8"))
 
+    def test_qr_email_includes_the_kid_seat_numbers(self):
+        """A family must see their child's free seat in the confirmation
+        email, in both the HTML and plain-text bodies — this exact gap was
+        flagged: previously a child's seat never appeared in the email."""
+        guest = Guest(
+            id=99994, name="Kid Family", email="kidfam@test.com", ticket_count=1,
+            plus_one_name="", qr_code="KIDFAM-QR-CODE", seat_numbers="1",
+            kid_seat_numbers="90,91",
+        )
+        with patch.dict(mock_secrets, {"MAIL_USERNAME": "sender@test.com", "MAIL_PASSWORD": "testpass"}):
+            with patch("smtplib.SMTP") as mock_smtp_cls:
+                mock_server = MagicMock()
+                mock_smtp_cls.return_value.__enter__.return_value = mock_server
+                self.assertTrue(send_qr_email(guest))
+
+        sent_msg = mock_server.send_message.call_args[0][0]
+        parts = {p.get_content_type(): p.get_payload(decode=True).decode("utf-8")
+                 for p in sent_msg.walk() if p.get_content_type().startswith("text/")}
+        expected = f"Free child seats: {config.format_seat_labels([90, 91])}"
+        self.assertIn(expected, parts["text/html"])
+        self.assertIn(expected, parts["text/plain"])
+
+    def test_qr_email_omits_the_kid_seat_line_when_there_are_no_kid_seats(self):
+        guest = Guest(
+            id=99993, name="No Kids", email="nokids@test.com", ticket_count=1,
+            plus_one_name="", qr_code="NOKIDS-QR-CODE", seat_numbers="1",
+        )
+        with patch.dict(mock_secrets, {"MAIL_USERNAME": "sender@test.com", "MAIL_PASSWORD": "testpass"}):
+            with patch("smtplib.SMTP") as mock_smtp_cls:
+                mock_server = MagicMock()
+                mock_smtp_cls.return_value.__enter__.return_value = mock_server
+                self.assertTrue(send_qr_email(guest))
+
+        sent_msg = mock_server.send_message.call_args[0][0]
+        html_part = next(p for p in sent_msg.walk() if p.get_content_type() == "text/html")
+        self.assertNotIn("Free child seats", html_part.get_payload(decode=True).decode("utf-8"))
+
     # ── Pure helpers: _normalize_postgres_url ───────────────────────────────
 
     def test_normalize_postgres_url_variants(self):
@@ -2033,6 +2097,31 @@ class TestPartyCheckIn(unittest.TestCase):
         # mutable state with the synchronous sender.
         guest = Guest(name="Sync Check", email="synccheck@test.com", ticket_count=1, qr_code="SYNC-QR")
         self.assertFalse(send_qr_email(guest))  # blank creds -> False, unchanged behavior
+
+    def test_send_qr_email_async_includes_kid_seat_numbers(self):
+        """The async send path (used by the actual registration hot path)
+        must carry kid seats through exactly like the sync path does."""
+        guest = {
+            "id": 6, "name": "Async Kid Family", "email": "asynckidfam@test.com",
+            "ticket_count": 1, "seat_numbers": "1", "kid_seat_numbers": "90,91",
+        }
+        done = threading.Event()
+        with patch.dict(mock_secrets, {"MAIL_USERNAME": "sender@test.com", "MAIL_PASSWORD": "testpass"}):
+            with patch("smtplib.SMTP") as mock_smtp_cls:
+                mock_server = MagicMock()
+                mock_smtp_cls.return_value.__enter__.return_value = mock_server
+                mock_server.send_message.side_effect = lambda *a, **k: done.set()
+
+                send_qr_email_async(guest)
+
+                self.assertTrue(done.wait(timeout=5), "background email send did not complete in time")
+
+        sent_msg = mock_server.send_message.call_args[0][0]
+        parts = {p.get_content_type(): p.get_payload(decode=True).decode("utf-8")
+                 for p in sent_msg.walk() if p.get_content_type().startswith("text/")}
+        expected = f"Free child seats: {config.format_seat_labels([90, 91])}"
+        self.assertIn(expected, parts["text/html"])
+        self.assertIn(expected, parts["text/plain"])
 
     # ── Postgres pool config: _get_engine_cached ────────────────────────────
 
@@ -2927,6 +3016,21 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertNotIn("you save", html_out)
         self.assertNotIn("savings", html_out)
 
+    def test_total_card_shows_free_child_seats_without_adding_to_the_money(self):
+        """Money is PAID seats only — free child seats must be visible so
+        nobody thinks they were undercharged or the kids were dropped, but
+        must never be folded into the dollar total."""
+        kid_seats = config.free_kid_seat_numbers()[:2]
+        html_out = theme.total_card(2, 7500, kid_seats=kid_seats)
+        self.assertIn("$75.00", html_out)
+        self.assertIn("2 free child seat", html_out)
+        self.assertIn(config.format_seat_labels(kid_seats), html_out)
+
+    def test_total_card_without_kid_seats_omits_the_kid_line(self):
+        """Existing callers that pass nothing keep working unchanged."""
+        html_out = theme.total_card(1, 5000)
+        self.assertNotIn("free child seat", html_out)
+
     def test_next_tier_nudge_states_the_new_price_and_renders_nothing_at_the_top(self):
         tier = config.next_price_tier(1)
         html_out = theme.next_tier_nudge(1, tier, config.ticket_price_cents_for(1))
@@ -3011,6 +3115,53 @@ class TestPartyCheckIn(unittest.TestCase):
         # 25 seats at 10/row is 3 rows (A, B, C) — no row D.
         self.assertNotIn('class="seat-row-label">D<', html_out)
 
+    # ── Seat map: the fourth state (FREE child seats) ───────────────────────
+
+    def test_seat_map_kid_seat_renders_distinct_from_selected_and_available(self):
+        kid_seat = config.free_kid_seat_numbers()[0]
+        html_out = theme.seat_map(
+            selected=[1], kid_selected=[kid_seat], taken=[], max_seats=config.TOTAL_SEATS,
+        )
+        cell = self._seat_cell_for(html_out, kid_seat)
+        self.assertIn("kid-seat", cell)
+        self.assertIn("free child seat", cell)
+        self.assertNotIn("seat-taken", cell)
+        # Not rendered as a paid `.selected` seat, and not left plain
+        # "available" either (its aria-label wouldn't say "available").
+        self.assertNotIn("selected", cell)
+        self.assertNotIn(", available", cell)
+
+    def test_seat_map_a_taken_seat_wins_over_a_kid_seat(self):
+        """Real inventory outranks a kid pick the same way it outranks a
+        stale paid pick — see the taken/selected precedence test above."""
+        kid_seat = config.free_kid_seat_numbers()[0]
+        html_out = theme.seat_map(
+            kid_selected=[kid_seat], taken=[kid_seat], max_seats=config.TOTAL_SEATS,
+        )
+        cell = self._seat_cell_for(html_out, kid_seat)
+        self.assertIn("seat-taken", cell)
+        self.assertNotIn("kid-seat", cell)
+
+    def test_seat_map_legend_has_child_seat_and_free_zone_entries(self):
+        html_out = theme.seat_map(max_seats=config.TOTAL_SEATS)
+        self.assertIn(config.free_kid_seat_range_label(), html_out)
+        self.assertIn("free for under-12s", html_out)
+        # Not "one child": config.MAX_KIDS_PER_REGISTRATION allows several,
+        # and a legend implying a one-child limit would turn families away.
+        self.assertNotIn("one child", html_out)
+        self.assertIn("Your child's free seat", html_out)
+
+    def test_seat_map_marks_the_free_eligible_zone_before_anything_is_picked(self):
+        """Even with nothing selected yet, the cheapest tier's cells carry a
+        subtle marker so guests can see where a child may sit free."""
+        kid_seat = config.free_kid_seat_numbers()[0]
+        html_out = theme.seat_map(max_seats=config.TOTAL_SEATS)
+        cell = self._seat_cell_for(html_out, kid_seat)
+        self.assertIn("free-zone", cell)
+        # A seat outside the free-eligible (cheapest) tier must not carry it.
+        other_cell = self._seat_cell_for(html_out, 1)
+        self.assertNotIn("free-zone", other_cell)
+
     def test_seat_breakdown_groups_a_non_contiguous_pick_by_tier(self):
         html_out = theme.seat_breakdown([1, 2, 90])
         self.assertIn(f"2 seats in {config.seat_label(1)}–{config.seat_label(25)}", html_out)
@@ -3062,6 +3213,44 @@ class TestPartyCheckIn(unittest.TestCase):
     def test_registration_confirmation_omits_seats_row_without_seat_numbers(self):
         html_out = theme.registration_confirmation("Solo Guest", "solo@example.com", 1, [])
         self.assertNotIn(">Seats<", html_out)
+
+    def test_registration_confirmation_includes_child_seats(self):
+        """A family must see their child's free seat on their own receipt,
+        not just the paid seats — this is the gap AGENTS.md flagged."""
+        kid_seats = config.free_kid_seat_numbers()[:2]
+        html_out = theme.registration_confirmation(
+            "Ada Lovelace", "ada@example.com", 1, [],
+            seat_numbers=[1], kid_seat_numbers=kid_seats,
+        )
+        self.assertIn("Free child seats", html_out)
+        self.assertIn(config.format_seat_labels(kid_seats), html_out)
+
+    def test_registration_confirmation_without_kid_seats_omits_the_row(self):
+        html_out = theme.registration_confirmation(
+            "Ada Lovelace", "ada@example.com", 1, [], seat_numbers=[1],
+        )
+        self.assertNotIn("Free child seats", html_out)
+
+    def test_guest_identity_card_includes_child_seats(self):
+        """Door staff need the whole party, including any free child
+        seats — not just what was paid for."""
+        kid_seats = config.free_kid_seat_numbers()[:2]
+        guest = {
+            "name": "Ada Lovelace", "email": "ada@example.com",
+            "phone": "+1-555-000-1111", "ticket_count": 1,
+            "seats": [1], "kid_seats": kid_seats, "plus_one_name": "",
+        }
+        html_out = theme.guest_identity_card(guest, bands=3, status_label="Not checked in yet")
+        self.assertIn("Child seats (free)", html_out)
+        self.assertIn(config.format_seat_labels(kid_seats), html_out)
+
+    def test_guest_identity_card_without_kid_seats_omits_the_row(self):
+        guest = {
+            "name": "No Kids", "email": "nokids@example.com",
+            "ticket_count": 1, "seats": [1], "plus_one_name": "",
+        }
+        html_out = theme.guest_identity_card(guest, bands=1, status_label="Not checked in yet")
+        self.assertNotIn("Child seats", html_out)
 
     # ── Seat pricing table: wording + real total (money-bug fix) ───────────
     # price_tier_table() used to read like a per-booking group-discount rate
