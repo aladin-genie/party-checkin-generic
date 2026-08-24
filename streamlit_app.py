@@ -12,7 +12,6 @@ import streamlit as st
 startup_error = None
 try:
     import base64
-    import html
     import os
     from datetime import datetime
 
@@ -25,9 +24,13 @@ except Exception:
     startup_error = traceback.format_exc()
 
 # ── Page Config ──────────────────────────────────────────────────────────────
+# The tab title leads with the performance name (config.PAGE_TITLE, built in
+# config.py — see its comment there), not just the org name. Guarded so a
+# config import failure (startup_error set above) can't crash this line by
+# reaching for a name on a module that never finished importing.
 st.set_page_config(
-    page_title=f"{config.EVENT_NAME if not startup_error else 'Party Check-In'} — Check-In",
-    page_icon="🎊",
+    page_title="Check-In" if startup_error else config.PAGE_TITLE,
+    page_icon="🎭",
     layout="centered",  # centered is better for mobile
     initial_sidebar_state="collapsed",  # collapsed by default for mobile
 )
@@ -117,6 +120,18 @@ def _cached_availability():
     return utils.ticket_availability()
 
 
+@st.cache_data(ttl=10, show_spinner=False)
+def _cached_seat_availability():
+    """Seat-inventory picture for the UI (see utils.seat_availability()).
+
+    Display only, and up to 10s stale — the number that actually decides
+    whether a registration is accepted is re-read inside the transaction by
+    utils.register_guest(), so a guest who submits just as a seat goes is
+    refused there rather than double-booked.
+    """
+    return utils.seat_availability()
+
+
 @st.cache_data(ttl=30, show_spinner=False)
 def _cached_registration_daily_counts():
     return utils.get_registration_daily_counts()
@@ -165,10 +180,13 @@ def _safe_active_count(register: bool = True) -> int:
 
 
 def _fmt_checkin_iso(iso_str, fmt="%I:%M %p"):
-    """Format an ISO-string checkin_time (as returned by Guest.to_dict()).
+    """Format an ISO-string checkin_time (as returned by Guest.to_dict()) as
+    LOCAL event time.
 
-    utils.format_dt() expects a real datetime, not the ISO string that dict
-    payloads carry, so this parses it back first. Tolerates None/garbage.
+    utils.format_event_local_dt() expects a real datetime, not the ISO
+    string that dict payloads carry, so this parses it back first (the
+    string is naive UTC, same as the stored column — see _utc_now()).
+    Tolerates None/garbage.
     """
     if not iso_str:
         return "—"
@@ -176,7 +194,7 @@ def _fmt_checkin_iso(iso_str, fmt="%I:%M %p"):
         dt = datetime.fromisoformat(iso_str)
     except Exception:
         return "—"
-    return utils.format_dt(dt, fmt)
+    return utils.format_event_local_dt(dt, fmt)
 
 
 # ── Flash messages ────────────────────────────────────────────────────────────
@@ -252,23 +270,33 @@ def page_home():
         pass
 
     # ── The flyer ───────────────────────────────────────────────────────────
-    # Renders nothing until the artwork exists at config.EVENT_FLYER.
-    st.markdown(theme.flyer_card(utils.event_flyer_src()), unsafe_allow_html=True)
+    # The centrepiece of Home, not an afterthought between the hero and the
+    # photo grid: a taller height cap, a gold-glow frame to match, and a
+    # caption tying it back to the event. Still renders nothing until the
+    # artwork exists at config.EVENT_FLYER (flyer_card() drops the caption
+    # right along with everything else for a blank src).
+    st.markdown(
+        theme.flyer_card(
+            utils.event_flyer_src(),
+            caption=f"{config.EVENT_SUBTITLE} · {config.EVENT_DATE_SHORT}",
+        ),
+        unsafe_allow_html=True,
+    )
 
     # ── Photos & sponsors ───────────────────────────────────────────────────
-    # Ahead of Party Buzz on purpose: a guest arriving here straight off the
-    # registration form came to see the party, not the analytics.
+    # Ahead of Community Buzz on purpose: a guest arriving here straight off
+    # the registration form came to see the event, not the analytics.
     _home_photos_section()
     _home_sponsors_section()
 
-    # ── Party Buzz ──────────────────────────────────────────────────────────
+    # ── Community Buzz ──────────────────────────────────────────────────────
     # Public, aggregate-only site activity — no guest names/emails/phones/
     # Zelle refs ever appear here. Moved from the admin dashboard: the owner
     # doesn't consider it sensitive and would rather show it off than bury it.
     site_stats = _cached_site_stats()
     st.markdown(
         theme.section_header(
-            "🎉 Party Buzz", "A live pulse of the site so far — nothing guest-specific, just the vibe."
+            "🔔 Community Buzz", "A live pulse of interest in the evening so far — nothing guest-specific."
         ),
         unsafe_allow_html=True,
     )
@@ -282,13 +310,29 @@ def page_home():
             unsafe_allow_html=True,
         )
     else:
+        # Just one number of pure site traffic (Registered Guests) used to
+        # sit awkwardly alone in a 4-up grid after the three raw-traffic
+        # tiles (Unique Visitors / Page Views / Visitors Today) were dropped
+        # as not guest-relevant. Paired here with seats remaining — the
+        # other number that actually matters to a guest deciding whether to
+        # register — both given "hero" emphasis so they read as a
+        # deliberate two-up row rather than one stranded tile plus empty
+        # space. Mirrors the admin dashboard's own hero-tile pairing
+        # (Checked In / Total Guests).
+        seat_avail = _cached_seat_availability()
         st.markdown(
             theme.stat_tiles(
                 [
-                    {"label": "Unique Visitors", "value": site_stats["unique_visitors"], "caption": "All time", "icon": "👀", "accent": "info"},
-                    {"label": "Page Views", "value": site_stats["total_visits"], "caption": "All time", "icon": "📈", "accent": "turquoise"},
-                    {"label": "Registered Guests", "value": site_stats["total_regs"], "caption": f"+{site_stats['today_regs']} today", "icon": "📝", "accent": "gold"},
-                    {"label": "Visitors Today", "value": site_stats["today_unique"], "caption": f"{site_stats['today_visits']} views", "icon": "🔥", "accent": "warn"},
+                    {
+                        "label": "Registered Guests", "value": site_stats["total_regs"],
+                        "caption": f"+{site_stats['today_regs']} today", "icon": "📝",
+                        "accent": "gold", "emphasis": "hero",
+                    },
+                    {
+                        "label": "Seats Remaining", "value": seat_avail["remaining"],
+                        "caption": f"of {seat_avail['total']} total", "icon": "💺",
+                        "accent": "turquoise", "emphasis": "hero",
+                    },
                 ]
             ),
             unsafe_allow_html=True,
@@ -343,7 +387,7 @@ def _home_photos_section() -> None:
     for a while, so the empty state has to read as "not yet", not "broken".
     """
     st.markdown(
-        theme.section_header("📸 Photos", "Moments from the party and the years before it."),
+        theme.section_header("📸 Photos", "Moments from the stage and the years before it."),
         unsafe_allow_html=True,
     )
     photos = utils.gallery_photos()
@@ -378,7 +422,7 @@ def _home_sponsors_section() -> None:
         st.markdown(
             theme.empty_state(
                 "🤝", "Sponsor lineup coming soon",
-                "We're still confirming this year's sponsors. Want to support the party? "
+                "We're still confirming this year's sponsors. Want to support this evening? "
                 "Get in touch with the organisers.",
             ),
             unsafe_allow_html=True,
@@ -416,8 +460,7 @@ def _render_registration_confirmation() -> None:
             guest["email"],
             guest["ticket_count"],
             utils.guest_names_list(guest.get("plus_one_name")),
-            guest.get("veg_count", 0),
-            guest.get("non_veg_count", 0),
+            guest.get("seats", []),
         ),
         unsafe_allow_html=True,
     )
@@ -479,7 +522,7 @@ def page_register():
     # so stale values don't appear when re-entering the page or clicking "Register Another".
     if st.session_state.get("reset_register_form"):
         for _key in ("reg_name", "reg_email", "reg_phone", "reg_plus_one", "reg_zelle", "ticket_count",
-                     "reg_veg_count", "reg_non_veg_count"):
+                     "selected_seats"):
             st.session_state.pop(_key, None)
         st.session_state["reg_agree"] = False
         st.session_state["reg_errors"] = {}
@@ -497,11 +540,13 @@ def page_register():
     with header_col2:
         _home_button(key="home_register")
 
-    # ── Ticket capacity ────────────────────────────────────────────────────
+    # ── Seat inventory ──────────────────────────────────────────────────────
     # Checked before anything else on the page: there's no point walking a
-    # guest through Zelle instructions for a party that's full.
-    availability = _cached_availability()
-    if availability["sold_out"]:
+    # guest through Zelle instructions for a party that's full. Seats are the
+    # real, individually-numbered inventory now (see config.SEAT_TIERS), so
+    # this is the authoritative "is there anything left to sell" read.
+    seat_avail = _cached_seat_availability()
+    if seat_avail["sold_out"]:
         st.markdown(theme.stepper(1), unsafe_allow_html=True)
         st.markdown(theme.sold_out_notice(utils.SOLD_OUT_MESSAGE), unsafe_allow_html=True)
         _home_button(key="home_sold_out")
@@ -523,119 +568,123 @@ def page_register():
         with st.expander("📜 View event flyer", expanded=False):
             st.markdown(theme.flyer_card(flyer_src), unsafe_allow_html=True)
 
+    # ── Seat selection ──────────────────────────────────────────────────────
+    # A value sitting in session_state that is no longer in `options` makes
+    # st.multiselect raise. Seats can be sold by another guest while this
+    # page is open, so any seat that's since gone must be pruned OUT of the
+    # guest's selection before the widget below is instantiated — the same
+    # defensive pattern the old ticket_count slider used for clamping.
+    available_seats = seat_avail["available"]
+    still_available = set(available_seats)
+    previously_selected = list(st.session_state.get("selected_seats", []))
+    pruned = sorted(s for s in previously_selected if s not in still_available)
+    if pruned:
+        st.session_state["selected_seats"] = [s for s in previously_selected if s in still_available]
+        pruned_label = ", ".join(str(s) for s in pruned)
+        st.warning(
+            f"Seat{'s' if len(pruned) != 1 else ''} {pruned_label} "
+            f"{'were' if len(pruned) != 1 else 'was'} just booked by someone else and "
+            "removed from your selection — please pick again."
+        )
+
+    max_tickets = config.MAX_TICKETS_PER_REGISTRATION
+    # Defensive clamp, mirroring the prune above: nothing in this file should
+    # be able to push more than max_tickets seats into session_state, but if
+    # it ever did, trim rather than let the widget raise.
+    current_selection = list(st.session_state.get("selected_seats", []))
+    if len(current_selection) > max_tickets:
+        st.session_state["selected_seats"] = current_selection[:max_tickets]
+    st.session_state.setdefault("selected_seats", [])
+
     # ── Zelle Payment Info Card ────────────────────────────────────────────
-    # Carries the whole group-discount table, with the row for the current
-    # selection highlighted. It has to render BEFORE the selector (that's
-    # where Step 1 belongs on the page), so it reads session_state for the
-    # count instead of the widget's return value further down — same number,
-    # just available earlier in the script.
-    selected_tickets = st.session_state.get("ticket_count", 1)
+    # Has to render BEFORE the seat picker (that's where Step 1 belongs on
+    # the page), so it reads session_state for the current pick instead of
+    # the widget's return value further down — same seats, just available
+    # earlier in the script.
+    selected_so_far = st.session_state.get("selected_seats", [])
     st.markdown(
-        theme.payment_card(ZELLE_INFO, config.price_tiers(), selected_tickets),
+        theme.payment_card(
+            ZELLE_INFO,
+            config.price_tiers(),
+            len(selected_so_far),
+            total_cents=config.seats_total_cents(selected_so_far),
+        ),
         unsafe_allow_html=True,
     )
-
-    # ── Ticket count & dynamic total (outside form so it updates live) ────
-    # Never offer more tickets than are actually left. Streamlit raises if a
-    # widget's session_state value sits outside its min/max, so an existing
-    # selection has to be clamped BEFORE the widget is instantiated — that
-    # happens when someone picks 8 tickets and other guests claim most of
-    # the remainder while this page is open.
-    max_tickets = config.MAX_TICKETS_PER_REGISTRATION
-    if not availability["unlimited"]:
-        max_tickets = max(1, min(max_tickets, availability["remaining"]))
-    try:
-        if int(st.session_state.get("ticket_count", 1)) > max_tickets:
-            st.session_state["ticket_count"] = max_tickets
-    except (TypeError, ValueError):
-        st.session_state["ticket_count"] = 1
 
     st.markdown(theme.section_header("Select Seats"), unsafe_allow_html=True)
+    # Two facts a guest choosing seats must not miss (kids free, food at the
+    # venue) — their own scannable chips right at the top of the seat
+    # selection area, not just buried in payment_card()'s prose above.
+    st.markdown(theme.seat_policy_chips(), unsafe_allow_html=True)
     st.markdown(theme.venue_info_card(), unsafe_allow_html=True)
-    ticket_count = st.slider(
-        "Number of Seats *",
-        min_value=1,
-        max_value=max_tickets,
-        value=1,
-        step=1,
-        key="ticket_count",
-        help=f"Select paid seats (up to {max_tickets}) — one per person age 12+. "
-             "Seats 1–25 are $50, 26–75 are $25, and 76+ are $10. Kids under 12 are free. "
-             "The total updates automatically as you change it.",
+
+    # Convenience fillers — picking dozens of seats one at a time is
+    # miserable. Each mutates selected_seats directly and reruns so the
+    # multiselect below reflects the new pick immediately.
+    def _seats_by_position(n):
+        return sorted(available_seats)[:n]
+
+    def _seats_by_price(n):
+        return sorted(available_seats, key=lambda s: (config.seat_price_cents(s), s))[:n]
+
+    fill_cols = st.columns(5)
+    with fill_cols[0]:
+        if st.button("Best available ×2", use_container_width=True, key="fill_best_2"):
+            st.session_state["selected_seats"] = _seats_by_position(min(2, max_tickets))
+            st.rerun()
+    with fill_cols[1]:
+        if st.button("Best available ×4", use_container_width=True, key="fill_best_4"):
+            st.session_state["selected_seats"] = _seats_by_position(min(4, max_tickets))
+            st.rerun()
+    with fill_cols[2]:
+        if st.button("Cheapest ×2", use_container_width=True, key="fill_cheap_2"):
+            st.session_state["selected_seats"] = _seats_by_price(min(2, max_tickets))
+            st.rerun()
+    with fill_cols[3]:
+        if st.button("Cheapest ×4", use_container_width=True, key="fill_cheap_4"):
+            st.session_state["selected_seats"] = _seats_by_price(min(4, max_tickets))
+            st.rerun()
+    with fill_cols[4]:
+        if st.button("Clear", use_container_width=True, key="fill_clear"):
+            st.session_state["selected_seats"] = []
+            st.rerun()
+
+    # `options` is the available seats plus whatever the guest already has
+    # selected, so their own picks can never vanish from the list even if
+    # this ever runs a beat behind the prune above.
+    option_seats = sorted(still_available | set(st.session_state.get("selected_seats", [])))
+
+    def _seat_option_label(seat):
+        return f"{config.seat_label(seat)} · ${config.seat_price_cents(seat) / 100:,.0f}"
+
+    selected_seats = st.multiselect(
+        "Select Seats *",
+        options=option_seats,
+        format_func=_seat_option_label,
+        key="selected_seats",
+        max_selections=max_tickets,
+        help=f"Pick your seats (up to {max_tickets}) — one per person age 12+. "
+             f"{config.seat_pricing_summary()} Kids under 12 are free. "
+             "The total updates automatically as you pick.",
     )
-    # Cinema-style visual map so guests see exactly which seats cost what.
-    st.markdown(theme.seat_map(ticket_count), unsafe_allow_html=True)
-    st.markdown(theme.seat_breakdown(ticket_count), unsafe_allow_html=True)
+
+    # Cinema-style visual map so guests see exactly which seats cost what,
+    # which are already taken, and which ones are theirs.
+    st.markdown(theme.seat_map(selected_seats, seat_avail["taken"]), unsafe_allow_html=True)
+    st.markdown(theme.seat_breakdown(selected_seats), unsafe_allow_html=True)
+
+    ticket_count = len(selected_seats)
+    total_cents = config.seats_total_cents(selected_seats)
+
     # The exact amount the guest is about to Zelle.
-    st.markdown(
-        theme.total_card(
-            ticket_count,
-            config.booking_total_cents(ticket_count),
-            config.booking_savings_cents(ticket_count) / 100,
-        ),
-        unsafe_allow_html=True,
-    )
-    # Worth knowing right after picking a quantity: how close they are to the
-    # next cheaper tier. Renders nothing when they're already on the best one,
-    # or when reaching it would exceed the per-registration cap.
-    st.markdown(
-        theme.next_tier_nudge(
-            ticket_count,
-            config.next_price_tier(ticket_count),
-            config.ticket_price_cents_for(ticket_count),
-        ),
-        unsafe_allow_html=True,
-    )
+    st.markdown(theme.total_card(ticket_count, total_cents), unsafe_allow_html=True)
 
     reg_errors = st.session_state.get("reg_errors", {})
-    if "ticket_count" in reg_errors:
-        st.markdown(theme.field_error(reg_errors["ticket_count"]), unsafe_allow_html=True)
-
-    # ── Meal count (outside the form, same reasoning as ticket_count: needs
-    # to update live as the ticket count changes) ─────────────────────────
-    # Streamlit raises if a widget's stored value sits outside its min/max at
-    # instantiation time, so an existing selection has to be clamped BEFORE
-    # the widgets below are instantiated — same pattern as the ticket_count
-    # clamp above, needed when the ticket count just got lowered.
-    if st.session_state.get("reg_veg_count", 0) > ticket_count:
-        st.session_state["reg_veg_count"] = ticket_count
-    if st.session_state.get("reg_non_veg_count", 0) > ticket_count:
-        st.session_state["reg_non_veg_count"] = ticket_count
-    # Food is available for purchase at the venue, so a fresh booking defaults
-    # to 0 meals until the guest decides what they want.
-    st.session_state.setdefault("reg_veg_count", 0)
-    st.session_state.setdefault("reg_non_veg_count", 0)
-
-    st.markdown(
-        theme.section_header(
-            "Meal Preferences",
-            "Food is available for purchase at the venue. Let us know your preferences so we can plan catering."
-        ),
-        unsafe_allow_html=True,
-    )
-    veg_col, non_veg_col = st.columns(2)
-    with veg_col:
-        veg_count = st.number_input(
-            "Veg Meals *",
-            min_value=0,
-            max_value=ticket_count,
-            step=1,
-            key="reg_veg_count",
-        )
-    with non_veg_col:
-        non_veg_count = st.number_input(
-            "Non-Veg Meals *",
-            min_value=0,
-            max_value=ticket_count,
-            step=1,
-            key="reg_non_veg_count",
-        )
-    st.markdown(
-        theme.food_count_requirement(ticket_count, veg_count, non_veg_count),
-        unsafe_allow_html=True,
-    )
-    if "food_count" in reg_errors:
-        st.markdown(theme.field_error(reg_errors["food_count"]), unsafe_allow_html=True)
+    if "seat_numbers" in reg_errors:
+        st.markdown(theme.field_error(reg_errors["seat_numbers"]), unsafe_allow_html=True)
+    if ticket_count == 0:
+        st.info("👆 Pick at least one seat to continue — a booking needs at least one seat.")
 
     # How many other people this booking has to name, stated before the field
     # rather than after a rejected submit. Lives outside the form alongside
@@ -741,44 +790,18 @@ def page_register():
         # rejected with no visible reason, since the error renders inside this
         # (default-collapsed) expander.
         with st.expander(
-            "📜 Terms & Conditions — Alcohol Disclaimer & Waiver",
+            "📜 Terms & Conditions — Participation Waiver",
             expanded=("terms" in reg_errors),
         ):
-            event_title = f"{html.escape(config.EVENT_NAME)} on {html.escape(config.EVENT_DATE_TEXT)}"
-            st.markdown(
-                f"""
-                <div style='color: rgba(245,245,245,0.85); font-size: 0.88rem; line-height: 1.5;'>
-                    <h4 style='color: #F4E4BC; margin-top: 0;'>Alcohol Disclaimer</h4>
-                    <p>
-                        I (Individual) or We (for all the listed attendees in this form and/or a person who is making group Zelle payment representing the group) the undersigned, hereby voluntarily assume all risks associated with participating in the activities related to the <strong>{event_title}</strong>.
-                    </p>
-                    <p>
-                        I/We understand that the {html.escape(config.EVENT_NAME)} organizers will not provide alcohol on-site, and that all alcohol at the event is BYOB (Bring Your Own Beverage). I/We acknowledge that consuming alcohol may impair judgment, motor skills, vision, and other abilities, and can lead to various health risks such as intoxication, nausea, vomiting, drowsiness, and other symptoms. I/We also understand that alcohol consumption can increase aggression and impair decision-making.
-                    </p>
-                    <p>
-                        I/We acknowledge that it is my responsibility to ensure that no underage or prohibited individuals in my group consume alcohol, and I/We will comply with all local laws regarding alcohol consumption during the event.
-                    </p>
-                    <p>
-                        I/We understand that the {html.escape(config.EVENT_NAME)} organizers are not responsible for any property damage, injuries, or fatalities that may result from alcohol consumption or any activities during the event. By participating, I/We hereby release and discharge the {html.escape(config.EVENT_NAME)} organizers, their owners, employees, volunteers, representatives, and agents from any and all liability for incidents occurring before, during, or after the event, including travel to and from the venue. This waiver includes, but is not limited to, liability arising from negligence.
-                    </p>
-                    <p>
-                        In consideration of being allowed to participate, I/We further agree to indemnify and hold harmless the {html.escape(config.EVENT_NAME)} organizers and their representatives from any claims or liabilities resulting from my participation in the event, including any consequences arising from alcohol consumption.
-                    </p>
-                    <p>
-                        I/We consent to receiving medical treatment deemed necessary in case of injury, accident, or illness during the event. I/We also acknowledge that I/We may be photographed or filmed during the event, and I/We grant permission for my likeness to be used by the event organizers and sponsors for legitimate purposes without compensation.
-                    </p>
-                    <p>
-                        By selecting <strong>"I/We Agree"</strong> below, I/We certify that I/We have read and understood this disclaimer and release of liability. I/We voluntarily agree to its terms and confirm that my participation is entirely voluntary.
-                    </p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            st.markdown(theme.terms_and_conditions_html(), unsafe_allow_html=True)
             agree_terms = st.checkbox("I/We Agree", key="reg_agree")
             if "terms" in reg_errors:
                 st.markdown(theme.field_error(reg_errors["terms"]), unsafe_allow_html=True)
 
-        submitted = st.form_submit_button("🎟️ Get My QR Code", type="primary", use_container_width=True)
+        submitted = st.form_submit_button(
+            "🎟️ Get My QR Code", type="primary", use_container_width=True,
+            disabled=(ticket_count == 0),
+        )
 
     # Live +1-XXX-XXX-XXXX formatting for the phone field above. Cosmetic
     # only — validate_registration/sanitize_phone still decide what is
@@ -795,7 +818,7 @@ def page_register():
         cleaned, errors = utils.validate_registration(
             name, email, phone, plus_one_name, zelle_ref, agree_terms,
             ticket_count=ticket_count,
-            veg_count=veg_count, non_veg_count=non_veg_count,
+            seat_numbers=selected_seats,
         )
 
         if errors:
@@ -809,7 +832,7 @@ def page_register():
                 zelle_ref=cleaned["zelle_ref"] or zelle_ref,
                 status="validation_error",
                 errors="; ".join(errors.values()),
-                veg_count=veg_count, non_veg_count=non_veg_count,
+                seat_numbers=cleaned["seat_numbers_str"],
             )
             st.rerun()
 
@@ -821,8 +844,7 @@ def page_register():
             cleaned["ticket_count"],
             cleaned["plus_one_name"],
             cleaned["zelle_ref"],
-            cleaned["veg_count"],
-            cleaned["non_veg_count"],
+            seat_numbers=cleaned["seat_numbers"],
         )
 
         if result["ok"]:
@@ -841,12 +863,13 @@ def page_register():
                 zelle_ref=cleaned["zelle_ref"],
                 status="registered",
                 guest_id=guest["id"],
-                veg_count=veg_count, non_veg_count=non_veg_count,
+                seat_numbers=cleaned["seat_numbers_str"],
             )
             _cached_stats.clear()
             _cached_site_stats.clear()
             _cached_registration_daily_counts.clear()
             _cached_availability.clear()
+            _cached_seat_availability.clear()
             _finish_registration(guest["id"])
         else:
             reason = result["reason"]
@@ -859,10 +882,25 @@ def page_register():
                 zelle_ref=cleaned["zelle_ref"],
                 status=reason,
                 errors=result["message"],
-                veg_count=veg_count, non_veg_count=non_veg_count,
+                seat_numbers=cleaned["seat_numbers_str"],
             )
             if reason == "duplicate_email":
                 st.session_state["reg_errors"] = {"email": result["message"]}
+                st.rerun()
+            elif reason == "seats_taken":
+                # Someone else's submit landed first and claimed one or more
+                # of these exact seats between this page's cached read and
+                # register_guest()'s in-transaction re-check — the one race
+                # that actually matters here. Refresh the cache, drop only
+                # the conflicting seats (keep the rest of the pick and every
+                # other field the guest already filled in), and let them
+                # re-pick rather than losing the whole form.
+                _cached_seat_availability.clear()
+                conflict = set(result.get("taken") or [])
+                st.session_state["selected_seats"] = [
+                    s for s in st.session_state.get("selected_seats", []) if s not in conflict
+                ]
+                _set_flash("error", result["message"])
                 st.rerun()
             elif reason in ("sold_out", "not_enough_tickets"):
                 # The last tickets went while this form was open. Refresh the
@@ -870,6 +908,7 @@ def page_register():
                 # sold-out screen), and carry the explanation across it —
                 # st.error here would be discarded by the rerun.
                 _cached_availability.clear()
+                _cached_seat_availability.clear()
                 _set_flash("error", result["message"])
                 st.rerun()
             elif reason == "db_unavailable":
@@ -1663,8 +1702,6 @@ def _admin_overview_tab():
                     {"label": "Plus Ones", "value": stats["plus_one_count"], "icon": "➕", "accent": "rust"},
                     {"label": "Named Guests", "value": stats["named_guests"], "icon": "👥", "accent": "rust"},
                     {"label": "Unnamed Tickets", "value": stats["unnamed_tickets"], "icon": "❓", "accent": "warn"},
-                    {"label": "Veg Meals", "value": stats["veg_total"], "icon": "🥦", "accent": "ok"},
-                    {"label": "Non-Veg Meals", "value": stats["non_veg_total"], "icon": "🍗", "accent": "turquoise"},
                 ]
             ),
             unsafe_allow_html=True,
@@ -1777,11 +1814,10 @@ def _admin_guests_tab():
                 "Email": g["email"],
                 "Phone": g["phone"] or "—",
                 "Tickets": g["ticket_count"],
+                "Seats": config.format_seat_labels(g["seats"]) or "—",
                 "Party Size": utils.party_size(g),
                 "Names": utils.guest_name_count(g["plus_one_name"]),
                 "Additional Guests": (g["plus_one_name"] or "").replace("\n", ", ") or "—",
-                "Veg": g["veg_count"],
-                "Non-Veg": g["non_veg_count"],
                 "Checked In": bool(g["checked_in"]),
                 "Band Given": bool(g["band_given"]),
                 "Delete": False,
@@ -1802,6 +1838,12 @@ def _admin_guests_tab():
             "Email": st.column_config.TextColumn("Email"),
             "Phone": st.column_config.TextColumn("Phone", help="“—” means the guest registered before phone became mandatory."),
             "Tickets": st.column_config.NumberColumn("Tickets"),
+            # Read-only: utils.apply_guest_changes() has no validation for a
+            # seat edit made here (no conflict check against other guests'
+            # seats), so an editable cell could silently double-book a seat.
+            # If seats ever need to change, do it through a new booking, not
+            # a hand edit in this grid.
+            "Seats": st.column_config.TextColumn("Seats", help="Booked seat labels (row + number). Read-only here — edits could silently double-book a seat."),
             "Party Size": st.column_config.NumberColumn(
                 "Party Size", help="Total people on this booking, including the person who registered."
             ),
@@ -1811,13 +1853,11 @@ def _admin_guests_tab():
                      "number means the booking predates mandatory guest names.",
             ),
             "Additional Guests": st.column_config.TextColumn("Additional Guests"),
-            "Veg": st.column_config.NumberColumn("Veg", help="Veg meal count, entered at registration."),
-            "Non-Veg": st.column_config.NumberColumn("Non-Veg", help="Non-veg meal count, entered at registration."),
             "Checked In": st.column_config.CheckboxColumn("Checked In", help="Tick to check this guest in."),
             "Band Given": st.column_config.CheckboxColumn("Band Given", help="Tick once their wristband is on."),
             "Delete": st.column_config.CheckboxColumn("Delete", help="Tick then Save changes — a confirmation step follows."),
         },
-        disabled=["id", "Name", "Email", "Phone", "Tickets", "Party Size", "Names", "Additional Guests", "Veg", "Non-Veg"],
+        disabled=["id", "Name", "Email", "Phone", "Tickets", "Seats", "Party Size", "Names", "Additional Guests"],
     )
 
     if st.button("💾 Save changes", type="primary", use_container_width=True, key="admin_save_changes"):
@@ -2049,7 +2089,7 @@ def main():
 
     # Mobile-friendly sidebar (collapsed by default, opens as overlay on mobile)
     with st.sidebar:
-        st.title("🎉 Party Check-In")
+        st.title("🎭 Check-In")
         st.markdown("---")
 
         page = st.radio(

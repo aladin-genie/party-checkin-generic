@@ -30,7 +30,8 @@
 ## 3. Post-Deploy Checklist
 
 - [ ] Open the app and confirm no "temporary local database" warning.
-- [ ] Confirm the registration page shows pricing: $50 (1–25), $25 (26–75), $10 (76+).
+- [ ] Confirm the registration page shows seat pricing: $50 (seats 1–25), $25 (26–75),
+      $10 (76–100) — **per seat**, with the exact booking total shown beside it.
 - [ ] Confirm Zelle info shows `dfwygana@gmail.com`.
 - [ ] Log in to Admin with the configured password.
 - [ ] Register a test guest and verify the QR code appears.
@@ -39,7 +40,7 @@
 ## 4. Before the Real Event
 
 - Update `config.py` with the real event name, date, venue, theme, photos, and sponsors.
-- Add the real flyer to `assets/flyer.jpg`.
+- Add the real flyer to `assets/` (WebP, ~1300px tall) and point `config.EVENT_FLYER` at it.
 - Add real photos to `assets/photos/` and list them in `config.PHOTOS`.
 - Add real sponsor logos to `assets/sponsors/` and list them in `config.SPONSORS`.
 - Update `EVENT_TIMEZONE` in `config.py` if the venue is not in America/Chicago.

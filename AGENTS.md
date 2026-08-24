@@ -61,16 +61,22 @@ locks everyone out of the admin dashboard rather than letting everyone in.
   Home and sets `just_registered`; Home then leads with
   `_render_registration_confirmation()`. There is no success screen on the Register page any
   more. E2E tests must pass an explicit page to `goto()` if they want Home.
-- **Ticket prices are tiered by booking size.** Never use `config.ticket_price_dollars()` to
-  quote or total anything — that's the *base* (1-ticket) price. Use
-  `ticket_price_cents_for()` / `booking_total_cents()` / `booking_savings_cents()`, which
-  apply `config.GROUP_DISCOUNT_TIERS` ($25 off at 26+, $40 off at 76+; boundaries are INCLUSIVE,
-  so exactly 26 tickets pays $25 and exactly 76 pays $10). Tiers are discounts off the base, so
-  they track `TICKET_PRICE_CENTS`. `config.MAX_TICKETS_PER_REGISTRATION` (100) must stay ≥ the
-  largest tier minimum (76) or that tier can't be bought;
-  `test_top_discount_tier_is_actually_bookable` enforces it. Money is computed in **integer
-  cents** — `get_stats()["revenue"]` sums per-booking via `_expected_revenue_cents()` rather
-  than `tickets × base_price`, which would over-report every group.
+- **Every SEAT has its own price — this is NOT a per-ticket group discount.**
+  `config.SEAT_TIERS` prices seat 1–25 at $50, 26–75 at $25, 76–100 at $10, boundaries
+  INCLUSIVE. A booking of N seats pays the SUM of seats 1..N, so 26 seats costs
+  $1,250 + $25 = **$1,275**, NOT 26 × $25. Never use `config.ticket_price_dollars()` to quote
+  or total anything — that's only the base (seat-1) price. Use `seat_price_cents()` /
+  `ticket_price_cents_for()` (marginal price of the next seat) / `booking_total_cents()` /
+  `booking_savings_cents()`.
+  **Copy rule:** never write "N tickets — $X each" anywhere. A guest reads that as N × $X and
+  underpays; that exact wording shipped once in `theme.price_tier_table()` and quoted $650 for
+  a booking the app charged $1,275 for, on the same screen as the Zelle handle. Say
+  "Seats 26–75 · $X per seat" and always show the real total alongside.
+  `config.MAX_TICKETS_PER_REGISTRATION` (100) must stay ≥ the largest tier minimum (76) or that
+  tier can't be bought; `test_top_discount_tier_is_actually_bookable` enforces it. Money is
+  computed in **integer cents** — `get_stats()["revenue"]` sums per-booking via
+  `_expected_revenue_cents()` rather than `tickets × base_price`, which would over-report
+  every group.
 - **`config.PHOTOS` / `config.SPONSORS` are hand-edited content**, so `utils` treats them as
   untrusted: `resolve_image_src()` is an allowlist (https / `data:image/` / local file only,
   any other scheme dropped), local files are inlined as data URIs relative to the *project
@@ -83,23 +89,40 @@ locks everyone out of the admin dashboard rather than letting everyone in.
   (`--leather`, `--tan`, `--gold`, `--rust`, `--turquoise`); the two accent tokens were renamed
   from `--violet`/`--cyan`, and `theme._STAT_ACCENTS` must stay in step with them or
   `stat_tiles()` silently drops the accent and the tile renders grey
-  (`test_stat_accents_match_the_themed_tokens` catches it). Rye is display-only (hero + brand
-  bar), Bitter carries headings, Inter carries body — don't put Rye on body copy, it has no
-  bold weight and is barely legible at small sizes. The ground stays DARK so it reads well on
-  phones in a dim ballroom.
-- **`config.EVENT_FLYER` names a file that does not exist yet.** That's deliberate —
-  `utils.event_flyer_src()` returns "" and both call sites render nothing until the artwork is
-  dropped in. Don't "fix" it by pointing it at a placeholder.
-- **`config.PHOTOS` and `config.SPONSORS` ship empty** so the Home page shows "coming soon"
-  placeholders until real photos and sponsor logos are added. When you do add stand-ins, keep
-  them unmistakably fake — never invent a plausible company name a guest could take for a real
-  backer. See `assets/README.md`.
+  (`test_stat_accents_match_the_themed_tokens` catches it). Tunga is display-only (hero +
+  brand bar), Bitter carries headings, Inter carries body — don't put Tunga on body copy, it
+  has no bold weight and is barely legible at small sizes. The ground stays DARK so it reads
+  well on phones in a dim hall.
+- **`config.EVENT_FLYER` is set and the artwork exists** (`assets/prasanga-flyer.webp`). It
+  renders on Home via `theme.flyer_card()` AND behind a collapsed expander on Register.
+  `utils.event_flyer_src()` still returns "" for a missing/blank path and both call sites then
+  render nothing, so blanking it is a safe way to drop the flyer.
+- **Local images are base64-inlined into the page HTML**, which Streamlit re-sends on every
+  rerun, so asset weight is page weight. Keep them WebP and no larger than they render:
+  the flyer is capped at `max-height: 70vh`, so ~1300px tall is the useful maximum. The flyer
+  was once listed in BOTH `config.EVENT_FLYER` and `config.PHOTOS[0]`, which inlined the same
+  ~717KB JPEG twice and pushed Home to 2.5MB of HTML per rerun. Don't reintroduce that — the
+  flyer is rendered by `flyer_card()`; `PHOTOS` is the gallery and should not repeat it.
+- **`config.SPONSORS` ships empty** so the Home page shows a "coming soon" placeholder until
+  real sponsor logos are added. When you do add stand-ins, keep them unmistakably fake — never
+  invent a plausible company name a guest could take for a real backer. See `assets/README.md`.
 - **Guest-name storage is derived, not fixed.** `utils.GUEST_NAMES_MAX_CHARS`
   (= `MAX_GUEST_NAMES × (MAX_NAME_LENGTH + 1)`) sizes three things that must agree: the
   `plus_one_name` columns, the `ALTER … TYPE VARCHAR(n)` in `init_db()`, and the Register
   form's `max_chars`. Never hardcode a width there — a fixed 1000 silently truncated the tail
   of a large booking's guest list when the ticket cap was raised, losing real people off the
   door list with no error.
+- **Timestamps are stored naive UTC and MUST be converted before display.**
+  `_utc_now()` writes `checkin_time` / `created_at` / `visited_at` as naive UTC. Use
+  `utils.format_event_local_dt()` (or `utils.to_event_local()`) for anything a human reads —
+  door staff, admin charts, the CSV export. `utils.format_dt()` is deliberately RAW: its only
+  correct caller is the admin backup caption, which labels itself "UTC". Getting this wrong is
+  not cosmetic: showing a 6:05 PM CDT check-in as "11:05 PM" misleads the door, and bucketing a
+  local event day against UTC values dropped every check-in after 7 PM local off the event-day
+  chart. To filter a stored column by a LOCAL day, convert the day's bounds to UTC with
+  `utils._local_day_utc_bounds()` — you cannot push a per-row conversion into the WHERE clause.
+  Known gap: the raw Postgres reporting views in `utils._reporting_view_sql()` still bucket on
+  UTC dates (`created_at::date`, `CURRENT_DATE`); they are organiser-run SQL, not app UI.
 - **Check-in is gated by an event-time window.** `utils.check_in_by_code()` refuses outside it
   and returns `status="not_open"`. Mode is persisted in the `app_settings` table
   (`checkin_mode` = `auto` | `open` | `closed`, default `auto`). Tests must call

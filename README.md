@@ -71,7 +71,7 @@ before the registration link goes out.
 | Piece | Where |
 |---|---|
 | Palette (`--leather`, `--tan`, `--gold`, `--rust`, `--turquoise`) | `theme.py` `:root` tokens |
-| Display face **Rye** (western) | Hero title + brand bar only — decorative, so it's used sparingly |
+| Display face **Tunga** (Kannada-traditional) | Hero title + brand bar only — decorative, so it's used sparingly |
 | Heading face **Bitter** (slab serif) | All `h1/h2/h3`, buttons, tier labels |
 | Body face **Inter** | Everything else — this is a form filled in on a phone |
 
@@ -85,10 +85,16 @@ local-language tagline. All three are optional — blank them and the hero degra
 
 ### The event flyer
 
-`config.EVENT_FLYER` points at `assets/flyer.png`, which **does not exist yet**. Drop the flyer
-artwork there and it appears on its own: full-width on Home, and behind a collapsed
-"📜 See the party flyer" expander on Register (collapsed so a tall poster never sits between a
-guest and the form they're trying to submit). Until then both call sites render nothing.
+`config.EVENT_FLYER` points at `assets/prasanga-flyer.webp`, which is in the repo. It appears
+full-width on Home, and behind a collapsed "📜 View event flyer" expander on Register
+(collapsed so a tall poster never sits between a guest and the form they're trying to submit).
+Blank `EVENT_FLYER`, or delete the file, and both call sites render nothing instead of breaking.
+
+Local images are base64-inlined into the page HTML — Streamlit serves no static files — and
+Streamlit re-sends that HTML on every rerun, so **asset weight is page weight**. Keep artwork
+in WebP and no bigger than it renders (the flyer is capped at `max-height: 70vh`, so ~1300px
+tall is the useful maximum). Do not also list the flyer in `config.PHOTOS`: that inlines the
+same image twice on Home.
 
 ### The registration link is the front door
 
@@ -101,30 +107,44 @@ Home is still reachable directly at `…/?page=Home`, from the sidebar, and from
 button in every page header. Changing `LANDING_PAGE` in `config.py` is all it takes to point
 the front door somewhere else.
 
-### Group discounts
+### Seat pricing
 
-The per-ticket price drops as a booking gets bigger. **One registration, one price** — the
-tier is decided by the ticket count on that single booking:
+**Each numbered seat has its own price, and a booking pays the sum of the seats it takes.**
+This is *not* a per-ticket group discount — the price of the Nth seat is not the price of all
+N seats.
 
-| Tickets on one booking | Price each | Total |
+| Seats | Price per seat |
+|---|---|
+| 1–25 | $50.00 |
+| 26–75 | $25.00 |
+| 76–100 | $10.00 |
+
+Worked examples — note how the total is a running sum, not a multiplication:
+
+| Seats booked | How it adds up | Total |
 |---|---|---|
-| 1–25 | $50.00 | e.g. 10 → $500.00 |
-| 26–75 | $25.00 | e.g. 50 → $1,250.00 |
-| 76–100 | $10.00 | e.g. 100 → $1,000.00 |
+| 10 | 10 × $50 | $500.00 |
+| 26 | 25 × $50 + 1 × $25 | **$1,275.00** |
+| 50 | 25 × $50 + 25 × $25 | $1,875.00 |
+| 100 | 25 × $50 + 50 × $25 + 25 × $10 | $2,750.00 |
 
-**The boundaries are inclusive of the lower bound**: a booking of exactly 26 pays $25,
-and exactly 76 pays $10. Guests price their group off that flyer, so the app
-has to agree with it at the boundary or somebody Zelles the wrong amount.
+> ⚠️ **Never describe this as "N tickets at $X each."** A guest reads that as N × $X and
+> underpays. The Register page's price table once said "26–75 tickets — $25.00 each" directly
+> above the Zelle address, implying $650 for a booking the app charged $1,275 for. Copy must
+> say "Seats 26–75 · $25.00 **per seat**" and show the real total next to it.
 
-The Register page shows the whole table above the ticket selector (with the guest's current
-row highlighted), the exact total under it, how much the discount saved, and a hint when the
-next tier is within reach.
+**The boundaries are inclusive of the lower bound**: seat 26 is the first $25 seat and seat 76
+the first $10 seat. Guests price their group off the printed flyer, so the app has to agree
+with it at the boundary or somebody Zelles the wrong amount.
 
-Tiers live in `config.GROUP_DISCOUNT_TIERS` as **`(minimum tickets, discount per ticket in
-cents)`**, applied against `TICKET_PRICE_CENTS`. They're stored as money *off the base* so
-that raising the base price moves every tier with it instead of silently turning a discount
-into a surcharge. `config.price_tiers()` derives the displayed table from the same constant
-the pricing functions use, so the form can't quote a price the app won't charge.
+The Register page shows the whole table above the ticket selector (with the current tier
+highlighted **and the exact amount to send**), a per-tier breakdown and the total under it, and
+a hint when the next cheaper seat is within reach.
+
+Tiers live in `config.SEAT_TIERS` as **`(first seat, last seat, price per seat in cents)`**.
+`config.price_tiers()` derives the displayed table, and `config.seat_pricing_summary()` derives
+the form's help sentence, from that same constant — so the form can't quote a price the app
+won't charge. `config.booking_total_cents()` is the single authority for what a booking owes.
 
 > **`MAX_TICKETS_PER_REGISTRATION` (100) must stay ≥ the largest tier minimum (76)**, or that
 > tier is advertised but unbuyable — there's a test that fails if it slips. Because
@@ -443,25 +463,30 @@ SELECT name, email, ticket_count, zelle_ref
 FROM guests WHERE NOT checked_in ORDER BY name;
 
 -- Money owed vs collected (cross-check against your Zelle history).
--- Priced per booking, because group discounts depend on each booking's own
--- size -- SUM(ticket_count) * 30 would over-report every group.
+-- Seats are priced individually (config.SEAT_TIERS: 1-25 = $50, 26-75 = $25,
+-- 76-100 = $10), so a booking owes the SUM of seats 1..ticket_count.
+-- SUM(ticket_count) * 50 would badly over-report every group booking.
+WITH owed AS (
+  SELECT id, ticket_count,
+         50 * MIN(ticket_count, 25)
+       + 25 * MAX(MIN(ticket_count, 75) - 25, 0)
+       + 10 * MAX(MIN(ticket_count, 100) - 75, 0) AS dollars_owed
+  FROM guests
+)
 SELECT COUNT(*) AS guests,
        SUM(ticket_count) AS tickets,
-       SUM(ticket_count * CASE WHEN ticket_count >= 20 THEN 28
-                               WHEN ticket_count >= 10 THEN 29
-                               ELSE 30 END) AS expected_dollars
-FROM guests;
+       SUM(dollars_owed) AS expected_dollars
+FROM owed;
+-- On PostgreSQL use LEAST()/GREATEST() in place of MIN()/MAX() above.
 
 -- What each booking should have paid, biggest first
 SELECT name, email, ticket_count,
-       CASE WHEN ticket_count >= 20 THEN 28
-            WHEN ticket_count >= 10 THEN 29
-            ELSE 30 END AS price_each,
-       ticket_count * CASE WHEN ticket_count >= 20 THEN 28
-                           WHEN ticket_count >= 10 THEN 29
-                           ELSE 30 END AS total_owed,
+       50 * MIN(ticket_count, 25)
+     + 25 * MAX(MIN(ticket_count, 75) - 25, 0)
+     + 10 * MAX(MIN(ticket_count, 100) - 75, 0) AS total_owed,
        zelle_ref
 FROM guests ORDER BY ticket_count DESC, name;
+-- On PostgreSQL use LEAST()/GREATEST() in place of MIN()/MAX() above.
 
 -- Everyone who listed extra guests, one name per line
 SELECT name, ticket_count, plus_one_name FROM guests

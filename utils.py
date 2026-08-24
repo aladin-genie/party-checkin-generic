@@ -103,8 +103,19 @@ class Guest(Base):
     band_given = Column(Boolean, default=False)
     checkin_time = Column(DateTime)
     created_at = Column(DateTime, default=_utc_now, index=True)
+    # Retained for historic rows only — the Meal Preferences feature was
+    # retired (food at the venue is now vegetarian-only, available for
+    # purchase, no per-guest counts collected). No longer populated; new
+    # rows keep the default=0. Do not resurrect a UI that writes these.
     veg_count = Column(Integer, default=0)
     non_veg_count = Column(Integer, default=0)
+    # Comma-joined, ascending seat numbers this booking actually holds, e.g.
+    # "3,4,17" — see utils.format_seat_numbers()/seat_numbers_list(). Blank
+    # ("") means this is a LEGACY row registered before seat-picking existed:
+    # it holds no specific seat we can name, but its ticket_count still
+    # consumes real capacity (see taken_seats()/seat_availability()). Sized
+    # for 512 chars, comfortably enough for a booking of all 100 seats.
+    seat_numbers = Column(String(512), default="")
 
     def to_dict(self):
         return {
@@ -122,6 +133,10 @@ class Guest(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "veg_count": self.veg_count,
             "non_veg_count": self.non_veg_count,
+            "seat_numbers": self.seat_numbers,
+            # Parsed form of seat_numbers, so UI code never has to split/parse
+            # the raw comma string itself.
+            "seats": seat_numbers_list(self.seat_numbers),
         }
 
 
@@ -165,8 +180,14 @@ class SubmissionLog(Base):
     errors = Column(String(500), default="")
     guest_id = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=_utc_now)
+    # Retained for historic rows only — see the matching comment on
+    # Guest.veg_count/non_veg_count. No longer populated on new submissions.
     veg_count = Column(Integer, default=0)
     non_veg_count = Column(Integer, default=0)
+    # Seats the attempt asked for, comma-joined — see Guest.seat_numbers.
+    # Recorded even on a failed attempt so organisers can see which seats a
+    # guest was trying for when e.g. a seats_taken conflict turned them away.
+    seat_numbers = Column(String(512), default="")
 
 
 class AppSetting(Base):
@@ -411,6 +432,11 @@ def init_db():
             with engine.connect() as conn:
                 conn.execute(text("ALTER TABLE guests ADD COLUMN non_veg_count INTEGER DEFAULT 0"))
                 conn.commit()
+        if "seat_numbers" not in cols:
+            from sqlalchemy import text
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE guests ADD COLUMN seat_numbers VARCHAR(512) DEFAULT ''"))
+                conn.commit()
 
     # Migration for existing submission_logs tables that pre-date the meal
     # count columns — mirrors the guests-table blocks above.
@@ -425,6 +451,11 @@ def init_db():
             from sqlalchemy import text
             with engine.connect() as conn:
                 conn.execute(text("ALTER TABLE submission_logs ADD COLUMN non_veg_count INTEGER DEFAULT 0"))
+                conn.commit()
+        if "seat_numbers" not in sub_cols:
+            from sqlalchemy import text
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE submission_logs ADD COLUMN seat_numbers VARCHAR(512) DEFAULT ''"))
                 conn.commit()
 
     # Widen plus_one_name to fit a full bulk guest-name list. The target width
@@ -760,20 +791,29 @@ def _named_guests_expr():
 def _expected_revenue_cents(session) -> int:
     """Total the guest list should have brought in, in cents.
 
-    Seat pricing is tiered per numbered seat (see config.SEAT_TIERS), so each
-    booking is charged the sum of seats 1..N via config.booking_total_cents —
-    `total_tickets × base_price` would over-state the take on every group.
+    Seat pricing is tiered per numbered seat (see config.SEAT_TIERS). A
+    booking that picked specific seats is charged the sum of THOSE seats
+    (config.seats_total_cents) — the seats need not be contiguous or start
+    at 1, so this can't be reduced to a function of ticket_count alone. A
+    legacy booking with no recorded seats (seat_numbers == "") falls back to
+    the old quantity-based pricing (config.booking_total_cents), since seats
+    1..N is all we know it consumed.
 
-    Integer cents throughout: this figure is meant to be reconciled against a
-    Zelle history line by line, so it must not accumulate float error across
-    a couple of hundred bookings.
+    One query over just the two needed columns (not per-row lookups) — it
+    can no longer be a single GROUP BY aggregate the way the old
+    ticket_count-only version was, because two bookings with the same
+    ticket_count can hold different, differently-priced seats. Integer cents
+    throughout: this figure is meant to be reconciled against a Zelle
+    history line by line, so it must not accumulate float error across a
+    couple of hundred bookings.
     """
     total_cents = 0
-    for ticket_count, bookings in session.query(
-        Guest.ticket_count, func.count(Guest.id)
-    ).group_by(Guest.ticket_count):
-        count = int(ticket_count or 0)
-        total_cents += int(bookings) * config.booking_total_cents(count)
+    for ticket_count, seats_raw in session.query(Guest.ticket_count, Guest.seat_numbers):
+        seats = seat_numbers_list(seats_raw)
+        if seats:
+            total_cents += config.seats_total_cents(seats)
+        else:
+            total_cents += config.booking_total_cents(int(ticket_count or 0))
     return total_cents
 
 
@@ -808,8 +848,6 @@ def get_stats() -> dict:
             ),
             func.coalesce(func.sum(case((Guest.plus_one_name != "", 1), else_=0)), 0),
             func.coalesce(func.sum(_named_guests_expr()), 0),
-            func.coalesce(func.sum(Guest.veg_count), 0),
-            func.coalesce(func.sum(Guest.non_veg_count), 0),
         ).one()
 
         total = int(row[0])
@@ -819,8 +857,6 @@ def get_stats() -> dict:
         admitted_tickets = int(row[4])
         plus_one_count = int(row[5])
         named_guests = int(row[6])
-        veg_total = int(row[7])
-        non_veg_total = int(row[8])
         # Clamped: a row hand-edited to name more people than it has tickets
         # would otherwise report a negative gap.
         unnamed_tickets = max(tickets - total - named_guests, 0)
@@ -831,12 +867,11 @@ def get_stats() -> dict:
         # Check-in percentage
         checkin_pct = round(checked_in / total * 100, 1) if total else 0.0
 
-        # Estimated revenue. Not tickets × one price: group discounts price
-        # each BOOKING by its own size (config.ticket_price_cents_for), so a
-        # flat multiply would over-report what the organiser should actually
-        # find in their Zelle history. Grouping by ticket_count keeps this to
-        # one extra aggregate query — at most ~30 rows back, one per possible
-        # booking size — rather than reading every guest row.
+        # Estimated revenue. Not tickets × one price: each booking is priced
+        # by its own seats (seat-picking bookings) or its own size (legacy
+        # bookings) — see _expected_revenue_cents — so a flat multiply would
+        # over-report what the organiser should actually find in their Zelle
+        # history.
         revenue = round(_expected_revenue_cents(session) / 100, 2)
 
         return {
@@ -852,8 +887,6 @@ def get_stats() -> dict:
             "avg_tickets_per_guest": avg_tickets,
             "checkin_percentage": checkin_pct,
             "revenue": revenue,
-            "veg_total": veg_total,
-            "non_veg_total": non_veg_total,
         }
     finally:
         session.close()
@@ -940,7 +973,7 @@ def _lock_ticket_capacity(session) -> None:
 
 
 SOLD_OUT_MESSAGE = (
-    "We're sold out — every ticket for the party has been claimed. "
+    "We're sold out — every seat for this performance has been claimed. "
     "Nothing was charged by this form, so if you've already sent a Zelle payment, "
     "message the organiser and they'll refund you or sort out a spot."
 )
@@ -1164,11 +1197,20 @@ def get_site_stats() -> dict:
     scalar subqueries (the same pattern as vw_site_activity_summary below)
     rather than six separate round trips — one statement dispatched to the
     database, regardless of how many subqueries it contains internally.
+
+    "Today" means the LOCAL (config.EVENT_TIMEZONE) calendar day, not the
+    UTC one: visited_at/created_at are stored naive UTC (see _utc_now()),
+    so filtering by the UTC date would, for hours after ~7 PM local,
+    silently count "today" activity into what the organiser sees as
+    tomorrow (or drop late-UTC-day rows already counted as today locally).
+    _local_day_utc_bounds() converts today's LOCAL midnight->midnight
+    window to UTC once, so the range filters below stay correct even though
+    the underlying columns are UTC and SQL can't run a per-row conversion.
     """
     flush_page_visits()
     session = get_db()
     try:
-        today = _utc_now().date()
+        today_start_utc, today_end_utc = _local_day_utc_bounds(to_event_local(_utc_now()).date())
 
         total_visits_sq = select(func.count(PageVisit.id)).scalar_subquery()
         unique_visitors_sq = select(
@@ -1176,18 +1218,18 @@ def get_site_stats() -> dict:
         ).scalar_subquery()
         today_visits_sq = (
             select(func.count(PageVisit.id))
-            .where(func.date(PageVisit.visited_at) == today)
+            .where(PageVisit.visited_at >= today_start_utc, PageVisit.visited_at < today_end_utc)
             .scalar_subquery()
         )
         today_unique_sq = (
             select(func.count(func.distinct(PageVisit.visitor_token)))
-            .where(func.date(PageVisit.visited_at) == today)
+            .where(PageVisit.visited_at >= today_start_utc, PageVisit.visited_at < today_end_utc)
             .scalar_subquery()
         )
         total_regs_sq = select(func.coalesce(func.sum(Guest.ticket_count), 0)).scalar_subquery()
         today_regs_sq = (
             select(func.coalesce(func.sum(Guest.ticket_count), 0))
-            .where(func.date(Guest.created_at) == today)
+            .where(Guest.created_at >= today_start_utc, Guest.created_at < today_end_utc)
             .scalar_subquery()
         )
 
@@ -1224,13 +1266,15 @@ def record_submission(
     status: str = "attempted",
     errors: str = "",
     guest_id: int = None,
-    veg_count: int = 0,
-    non_veg_count: int = 0,
+    seat_numbers: str = "",
 ) -> None:
     """Persist a registration submission attempt to Supabase/Postgres.
 
     This creates an audit trail for every form submit, successful or not.
     Safe to call frequently — failures are caught and logged, not raised.
+    `seat_numbers` is the comma-joined string form (e.g. from
+    validate_registration()'s cleaned["seat_numbers_str"]) so a failed
+    seats_taken attempt still records which seats the guest was trying for.
     """
     session = get_db()
     try:
@@ -1244,8 +1288,7 @@ def record_submission(
             status=status,
             errors=errors[:500],
             guest_id=guest_id,
-            veg_count=veg_count,
-            non_veg_count=non_veg_count,
+            seat_numbers=(seat_numbers or "")[:512],
         )
         session.add(log)
         session.commit()
@@ -1425,20 +1468,31 @@ def _build_qr_email_message(
     ticket_count,
     plus_one_name: str,
     qr_code: str,
-    veg_count=0,
-    non_veg_count=0,
+    seat_numbers: str = "",
 ) -> MIMEMultipart:
     """Build the multipart QR-code email (HTML + plain-text + inline image).
 
     Pure function: no I/O, no secrets, no Streamlit — safe to call from any
     thread. Shared by send_qr_email (sync) and send_qr_email_async
     (background thread) so the two message bodies cannot drift apart.
+
+    `seat_numbers` is the comma-joined string form (Guest.seat_numbers /
+    guest["seat_numbers"]) — a guest arriving at the door needs their seat
+    numbers in hand, so this puts them in both the HTML and plain-text
+    bodies near the ticket count, in the venue-style labels
+    (config.format_seat_labels(), e.g. "A3, A4, B7") they saw on the seat
+    map rather than the raw stored integers. Blank for a legacy booking with
+    no seats on file, in which case the line is omitted entirely.
     """
     qr_image = generate_qr_image(qr_code)
 
     # Escape every interpolated value before it goes into the HTML body.
     safe_name = html.escape(guest_name or "")
     safe_qr_code = html.escape(qr_code or "")
+
+    seats = seat_numbers_list(seat_numbers)
+    seats_text = f"🪑 Seats: {config.format_seat_labels(seats)}" if seats else ""
+    safe_seats_text = html.escape(seats_text)
 
     # plus_one_name holds every additional guest, newline-joined — rendering
     # it as one escaped blob would run all the names together on a single
@@ -1471,8 +1525,6 @@ def _build_qr_email_message(
     my_qr_url = f"{config.APP_URL}/?page=My%20QR&guest_id={guest_id}"
     safe_my_qr_url = html.escape(my_qr_url)
 
-    meals_line = f"🍽️ Meals: {int(veg_count or 0)} veg, {int(non_veg_count or 0)} non-veg"
-
     # HTML body with inline QR image and a plain-text fallback
     html_body = f"""\
 <html>
@@ -1480,7 +1532,7 @@ def _build_qr_email_message(
     <h2>Hi {safe_name}!</h2>
     <p>You're registered for <strong>{html.escape(event_title)} — {html.escape(config.EVENT_TAGLINE)}!</strong></p>
     <p>🎫 Tickets: {ticket_count}</p>
-    <p>{html.escape(meals_line)}</p>
+    {"<p>" + safe_seats_text + "</p>" if seats_text else ""}
     {plus_one_line}
     <p>📅 Date: {html.escape(config.EVENT_DATE_TEXT)}<br>
        🕕 Time: {html.escape(config.EVENT_TIME_TEXT)}<br>
@@ -1502,7 +1554,7 @@ def _build_qr_email_message(
 You're registered for {event_title} — {config.EVENT_TAGLINE}!
 
 🎫 Tickets: {ticket_count}
-{meals_line}
+{seats_text}
 {plus_one_text}
 📅 Date: {config.EVENT_DATE_TEXT}
 🕕 Time: {config.EVENT_TIME_TEXT}
@@ -1578,8 +1630,7 @@ def send_qr_email(guest) -> bool:
         guest.ticket_count,
         guest.plus_one_name,
         guest.qr_code,
-        guest.veg_count,
-        guest.non_veg_count,
+        getattr(guest, "seat_numbers", ""),
     )
     return _smtp_send(secrets["mail_server"], secrets["mail_port"], secrets["mail_username"], secrets["mail_password"], msg)
 
@@ -1613,8 +1664,7 @@ def send_qr_email_async(guest: dict) -> None:
     qr_code = guest.get("qr_code", "")
     phone = guest.get("phone", "")
     zelle_ref = guest.get("zelle_ref", "")
-    veg_count = guest.get("veg_count", 0)
-    non_veg_count = guest.get("non_veg_count", 0)
+    seat_numbers = guest.get("seat_numbers", "")
 
     def _worker():
         error_text = ""
@@ -1622,7 +1672,7 @@ def send_qr_email_async(guest: dict) -> None:
             msg = _build_qr_email_message(
                 secrets["mail_sender"], guest_id, guest_name, guest_email,
                 ticket_count, plus_one_name, qr_code,
-                veg_count, non_veg_count,
+                seat_numbers,
             )
             sent = _smtp_send(
                 secrets["mail_server"], secrets["mail_port"],
@@ -1661,10 +1711,15 @@ def send_qr_email_async(guest: dict) -> None:
 # ── Welcome Announcement ──────────────────────────────────────────────────────
 
 def generate_welcome_announcement(name: str, ticket_count: int) -> str:
-    """Generate welcome announcement text for speech synthesis."""
-    if ticket_count == 1:
-        return f"Welcome {name}! You have 1 ticket. Enjoy the party!"
-    return f"Welcome {name}! You have {ticket_count} tickets. Enjoy the party!"
+    """Generate welcome announcement text for speech synthesis.
+
+    Read aloud at the door, so the wording has to suit the event: this is a
+    devotional Yakshagana performance, not a party. The old text ended
+    "Enjoy the party!" — a leftover from the template this app was cloned
+    from, and the last thing a guest heard on arriving at a temple hall.
+    """
+    ticket_word = "ticket" if ticket_count == 1 else "tickets"
+    return f"Welcome {name}! You have {ticket_count} {ticket_word}. Enjoy the show!"
 
 
 # ── Home Page Content: Photos & Sponsors ──────────────────────────────────────
@@ -1864,6 +1919,13 @@ def format_dt(dt, fmt: str = "%I:%M %p", fallback: str = "—") -> str:
 
     checkin_time can be NULL while checked_in is True (e.g. rows edited
     outside the app), so callers must not call .strftime() on it directly.
+
+    This is deliberately RAW — no timezone conversion. Every timestamp is
+    stored naive UTC (see _utc_now()), so a value passed straight through
+    here prints as UTC. That is exactly right for the one caller that wants
+    it (the admin backup-snapshot caption explicitly labels it "UTC"); every
+    caller showing a time to a human at the door or on a chart should use
+    format_event_local_dt() instead.
     """
     if dt is None:
         return fallback
@@ -1871,6 +1933,74 @@ def format_dt(dt, fmt: str = "%I:%M %p", fallback: str = "—") -> str:
         return dt.strftime(fmt)
     except Exception:
         return fallback
+
+
+def _event_tzinfo():
+    """Return a ZoneInfo for config.EVENT_TIMEZONE, or raise if unavailable.
+
+    Callers must catch and fall back — this mirrors the shared-raise-point
+    style of config._event_start_local_aware().
+    """
+    if config.ZoneInfo is None:
+        raise RuntimeError("zoneinfo module unavailable")
+    return config.ZoneInfo(config.EVENT_TIMEZONE)
+
+
+def to_event_local(dt):
+    """Convert a naive-UTC datetime (as stored, see _utc_now()) to naive
+    local time in config.EVENT_TIMEZONE.
+
+    Every checkin_time/created_at/visited_at is stored naive UTC, but every
+    screen that shows one to a human means it as local event time. Must
+    never raise: returns dt unchanged if it is None, and degrades to a
+    fixed offset if the tz database is unavailable — same fallback story as
+    config.event_start_utc().
+    """
+    if dt is None:
+        return dt
+    try:
+        aware_utc = dt.replace(tzinfo=timezone.utc)
+        return aware_utc.astimezone(_event_tzinfo()).replace(tzinfo=None)
+    except Exception as e:
+        print(f"utils.to_event_local: zoneinfo unavailable, falling back to UTC-{config._FALLBACK_UTC_OFFSET_HOURS}: {e}")
+        return dt - timedelta(hours=config._FALLBACK_UTC_OFFSET_HOURS)
+
+
+def format_event_local_dt(dt, fmt: str = "%I:%M %p", fallback: str = "—") -> str:
+    """Format a stored (naive-UTC) datetime as local event time, tolerating
+    None.
+
+    Same contract as format_dt(), but converts via to_event_local() first.
+    Use this everywhere a timestamp is shown to a human (door staff,
+    admin charts, CSV export); format_dt() itself stays raw/UTC on purpose.
+    """
+    return format_dt(to_event_local(dt), fmt, fallback)
+
+
+def _local_day_utc_bounds(local_date):
+    """Return (start_utc, end_utc): the naive-UTC instants bounding local
+    midnight through local midnight-the-next-day of `local_date`, in
+    config.EVENT_TIMEZONE.
+
+    Filtering a naive-UTC-stored column (checkin_time, created_at,
+    visited_at) by a LOCAL calendar day has to happen this way round:
+    convert the day's boundaries to UTC once, then compare stored values
+    against those with >=/< . Converting every row to local time instead
+    (to_event_local() + .date()) can't be pushed into the SQL WHERE clause.
+
+    Must never raise: falls back to config._FALLBACK_UTC_OFFSET_HOURS if the
+    tz database is unavailable, same story as config.event_start_utc().
+    """
+    local_midnight = datetime(local_date.year, local_date.month, local_date.day)
+    try:
+        tz = _event_tzinfo()
+        start_utc = local_midnight.replace(tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
+        end_utc = (local_midnight + timedelta(days=1)).replace(tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
+        return start_utc, end_utc
+    except Exception as e:
+        print(f"utils._local_day_utc_bounds: zoneinfo unavailable, falling back to UTC-{config._FALLBACK_UTC_OFFSET_HOURS}: {e}")
+        offset = timedelta(hours=config._FALLBACK_UTC_OFFSET_HOURS)
+        return local_midnight + offset, local_midnight + timedelta(days=1) + offset
 
 
 # ── CSV Export ──────────────────────────────────────────────────────────────────
@@ -1886,16 +2016,26 @@ def _sanitize_csv_field(value: str) -> str:
 
 
 def generate_csv() -> str:
-    """Generate CSV content of all guests. Returns CSV string."""
+    """Generate CSV content of all guests. Returns CSV string.
+
+    The Check-in Time column is LOCAL event time (config.EVENT_TIMEZONE),
+    not the raw UTC value stored in the database — an organiser reconciling
+    this against a Zelle history or a door log thinks in local time. The
+    column header names the timezone explicitly so nobody has to guess.
+
+    The Seats column shows venue-style labels (config.format_seat_labels(),
+    e.g. "A3, A4, B7") rather than the raw stored integers — this is a
+    human-facing door list, and the DB/backup export keep the integer form.
+    """
     session = get_db()
     try:
         guests = session.query(Guest).all()
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow([
-            "Name", "Email", "Phone", "Tickets", "Additional Guests",
-            "Additional Guest Names", "Zelle Ref", "Veg", "Non-Veg",
-            "Checked In", "Band Given", "Check-in Time", "QR Code"
+            "Name", "Email", "Phone", "Tickets", "Seats", "Additional Guests",
+            "Additional Guest Names", "Zelle Ref",
+            "Checked In", "Band Given", f"Check-in Time ({config.EVENT_TIMEZONE})", "QR Code"
         ])
         for g in guests:
             writer.writerow([
@@ -1903,6 +2043,10 @@ def generate_csv() -> str:
                 _sanitize_csv_field(g.email),
                 _sanitize_csv_field(g.phone),
                 g.ticket_count,
+                # The door list needs the actual seat labels, not just a
+                # count — blank ("—") means a legacy row with no seats on
+                # file (see Guest.seat_numbers).
+                _sanitize_csv_field(config.format_seat_labels(seat_numbers_list(g.seat_numbers))) or "—",
                 guest_name_count(g.plus_one_name),
                 # Comma-joined, not raw: the names are stored newline-joined,
                 # and a cell with embedded newlines makes one guest's row
@@ -1910,11 +2054,9 @@ def generate_csv() -> str:
                 # (export_backup) still writes the column verbatim.
                 _sanitize_csv_field(", ".join(guest_names_list(g.plus_one_name))),
                 _sanitize_csv_field(g.zelle_ref),
-                g.veg_count,
-                g.non_veg_count,
                 "Yes" if g.checked_in else "No",
                 "Yes" if g.band_given else "No",
-                format_dt(g.checkin_time, "%Y-%m-%d %H:%M:%S", ""),
+                format_event_local_dt(g.checkin_time, "%Y-%m-%d %H:%M:%S", ""),
                 g.qr_code,
             ])
         return output.getvalue()
@@ -2343,6 +2485,219 @@ def sanitize_zelle_ref(ref: str) -> str:
     return ref
 
 
+# ── Seats: parsing/formatting ────────────────────────────────────────────────
+# Cinema-style seat picking: a guest chooses specific seat numbers rather
+# than just a quantity (see config.SEAT_TIERS / config.seats_total_cents).
+# These are the pure parse/format helpers; taken_seats()/available_seats()/
+# seat_availability() below are the DB-backed inventory reads.
+
+def seat_numbers_list(value) -> list:
+    """Parse a stored Guest.seat_numbers value back into a sorted list of ints.
+
+    Mirrors the defensive style of guest_names_list(): tolerates None/blank
+    input and any entry that isn't a whole number (skipping it rather than
+    raising or dropping the whole list), since this reads a column a hand
+    edit could have put anything into. De-duplicates and sorts ascending so
+    every reader sees the same order regardless of how it was written.
+    """
+    seats = set()
+    for part in (value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            seats.add(int(part))
+        except (TypeError, ValueError):
+            continue
+    return sorted(seats)
+
+
+def format_seat_numbers(seats) -> str:
+    """Inverse of seat_numbers_list(): sorted, de-duplicated, comma-joined.
+
+    This is the exact string form written to Guest.seat_numbers /
+    SubmissionLog.seat_numbers ("3,4,17", ascending, no duplicates) — every
+    writer should go through this rather than joining a list ad hoc, so
+    every reader can rely on the stored format. Must never raise: a
+    non-integer entry is silently skipped.
+    """
+    cleaned = set()
+    for seat in (seats or []):
+        try:
+            cleaned.add(int(seat))
+        except (TypeError, ValueError):
+            continue
+    return ",".join(str(n) for n in sorted(cleaned))
+
+
+def parse_seat_selection(value) -> tuple:
+    """Normalise arbitrary user input into validated seat numbers.
+
+    Accepts either a list/tuple/set of seat numbers (as the seat-map UI would
+    send) or a comma/space-separated string (a hand-typed fallback). Returns
+    (seats, reason), the same shape as parse_guest_names():
+
+    - (sorted unique list, "") on success
+    - ([], "") for blank/empty input — "not provided", not itself a failure
+      (validate_registration() is what turns an empty pick into an error)
+    - ([], "invalid") if any entry isn't a whole seat number
+    - ([], "out_of_range") if any entry is outside 1..config.TOTAL_SEATS
+    """
+    if value is None:
+        return [], ""
+
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return [], ""
+        parts = [p for p in re.split(r"[,\s]+", raw) if p]
+    else:
+        try:
+            parts = list(value)
+        except TypeError:
+            return [], "invalid"
+        if not parts:
+            return [], ""
+
+    seats = []
+    for part in parts:
+        if isinstance(part, bool):
+            return [], "invalid"
+        try:
+            n = int(part)
+        except (TypeError, ValueError):
+            return [], "invalid"
+        if isinstance(part, float) and part != n:
+            return [], "invalid"
+        seats.append(n)
+
+    if any(n < 1 or n > config.TOTAL_SEATS for n in seats):
+        return [], "out_of_range"
+
+    return sorted(set(seats)), ""
+
+
+# ── Seats: live inventory ────────────────────────────────────────────────────
+# Distinct from ticket_availability() (a plain head count): this tracks WHICH
+# numbered seats are actually taken, so a seat-map UI can grey out sold seats
+# and register_guest() can refuse a specific seat someone else just bought.
+
+def taken_seats(session=None) -> set:
+    """Return every seat number currently held by any guest row.
+
+    One query over Guest.seat_numbers, parsed in Python. Legacy rows
+    (seat_numbers == "") contribute no seat numbers here — we don't know
+    which physical seats they hold — but they DO still consume capacity; see
+    seat_availability() for how that's accounted for separately.
+
+    Pass an open `session` to read inside a caller's transaction — that is
+    what makes the re-check in register_guest() authoritative: taken behind
+    _lock_ticket_capacity()'s advisory lock, a fresh SELECT on the same
+    connection sees every seat committed by another booking under
+    READ COMMITTED, even mid-transaction.
+
+    Must never raise: returns an empty set and prints a diagnostic if the DB
+    is unavailable, matching how ticket_availability() degrades today.
+    """
+    own_session = session is None
+    session = session or get_db()
+    try:
+        taken = set()
+        for (raw,) in session.query(Guest.seat_numbers).all():
+            taken.update(seat_numbers_list(raw))
+        return taken
+    except Exception as e:
+        print(f"utils.taken_seats unavailable, treating as no seats taken: {e}")
+        return set()
+    finally:
+        if own_session:
+            session.close()
+
+
+def available_seats() -> list:
+    """All seat numbers not currently held by any guest row, ascending."""
+    taken = taken_seats()
+    return [s for s in config.all_seat_numbers() if s not in taken]
+
+
+def _legacy_ticket_count(session=None) -> int:
+    """Total ticket_count sitting on rows with no seat_numbers recorded.
+
+    These are bookings made before seat-picking existed (or a quantity-based
+    booking made since): we cannot say which physical seats they occupy, but
+    they still hold that many seats out of the venue's real capacity. Used by
+    seat_availability() so `remaining` can never be oversold by forgetting
+    about them.
+    """
+    own_session = session is None
+    session = session or get_db()
+    try:
+        return int(
+            session.query(func.coalesce(func.sum(Guest.ticket_count), 0))
+            .filter(or_(Guest.seat_numbers == "", Guest.seat_numbers.is_(None)))
+            .scalar() or 0
+        )
+    finally:
+        if own_session:
+            session.close()
+
+
+def seat_availability() -> dict:
+    """Return the current seat-inventory picture for the UI.
+
+    {"taken": set, "available": [...], "total": TOTAL_SEATS, "remaining": int,
+    "sold_out": bool, "legacy_tickets": int}.
+
+    `remaining` subtracts BOTH the explicitly-taken seats AND the
+    ticket_count of every legacy row with no seat_numbers recorded (see
+    _legacy_ticket_count) — a legacy row consumed real capacity even though
+    we can't say which seat, so leaving it out would let the venue be
+    oversold by exactly that many seats. `legacy_tickets` reports that
+    number on its own so the admin/UI can surface it.
+
+    Must never raise: a DB blip degrades to reporting no seats available
+    (sold_out) rather than wrongly telling guests seats they can't actually
+    have are free — register_guest()'s in-transaction re-check is what
+    actually prevents a double-booking, not this display read.
+    """
+    total = config.TOTAL_SEATS
+    try:
+        taken = taken_seats()
+        legacy_tickets = _legacy_ticket_count()
+        available = [s for s in config.all_seat_numbers() if s not in taken]
+        remaining = max(0, total - len(taken) - legacy_tickets)
+        return {
+            "taken": taken,
+            "available": available,
+            "total": total,
+            "remaining": remaining,
+            "sold_out": remaining <= 0,
+            "legacy_tickets": legacy_tickets,
+        }
+    except Exception as e:
+        print(f"utils.seat_availability unavailable, treating as sold out: {e}")
+        return {
+            "taken": set(), "available": [], "total": total, "remaining": 0,
+            "sold_out": True, "legacy_tickets": 0,
+        }
+
+
+def _seats_taken_message(conflict) -> str:
+    """Message for a registration where one or more picked seats were just
+    taken by another booking. Names the specific seats the way the guest saw
+    them on the seat map (config.seat_label(), e.g. "Seat B7 was just
+    taken"), not the raw stored integer, so they can go straight back and
+    pick different ones."""
+    plural = len(conflict) != 1
+    seat_word = "Seats" if plural else "Seat"
+    verb = "were" if plural else "was"
+    seat_list = config.format_seat_labels(conflict)
+    return (
+        f"{seat_word} {seat_list} {verb} just taken by another booking. "
+        "Please pick different seats and submit again."
+    )
+
+
 # ── Service Layer ──────────────────────────────────────────────────────────────
 # Business logic pulled out of the UI so it is unit-testable and reusable.
 # Every function here opens its own session, always closes it in `finally`,
@@ -2356,33 +2711,40 @@ def validate_registration(
     zelle_ref: str,
     agree_terms: bool,
     ticket_count=1,
-    veg_count=0,
-    non_veg_count=0,
+    seat_numbers=None,
 ) -> tuple:
     """Validate and sanitize registration form fields.
 
     Returns (cleaned, errors): two dicts keyed by "name", "email", "phone",
-    "ticket_count", "plus_one_name", "zelle_ref", "terms", "food_count".
-    `cleaned` holds the sanitized value for every field (empty string/False
-    if invalid or not provided) plus "additional_guest_count", the number of
-    guests actually named, and "veg_count"/"non_veg_count", the cleaned meal
-    counts. `errors` holds a user-facing message only for fields that failed
-    validation (fields that passed are simply absent from `errors`).
+    "ticket_count", "plus_one_name", "zelle_ref", "terms" (and
+    "seat_numbers" — see below). `cleaned` holds the sanitized value for
+    every field (empty string/False if invalid or not provided) plus
+    "additional_guest_count", the number of guests actually named. `errors`
+    holds a user-facing message only for fields that failed validation
+    (fields that passed are simply absent from `errors`).
 
-    Guest names are validated AGAINST the ticket count: a booking of N
-    tickets is the registrant plus N-1 other people, so exactly N-1
-    additional names are required (see additional_guests_expected). Names
-    used to be free-form and optional, which meant a 6-ticket booking could
-    arrive with nobody named — the organiser then had no idea who the other
-    five people were, and the door had no list to check against. Requiring
-    them here is the only point in the flow where the guest is still present
-    to answer.
+    `seat_numbers`, when passed (not None), makes seat-picking the authority
+    for this booking instead of a plain quantity: it is run through
+    parse_seat_selection() and, once valid, its LENGTH becomes
+    cleaned["ticket_count"] — the `ticket_count` argument is then ignored.
+    An empty pick, an unparseable entry, an out-of-range seat number, or more
+    seats than config.MAX_TICKETS_PER_REGISTRATION all set
+    errors["seat_numbers"] with a message the guest can act on.
+    cleaned["seat_numbers"] holds the normalised (sorted, de-duplicated) list
+    of ints and cleaned["seat_numbers_str"] the comma-joined string form
+    (see format_seat_numbers) ready to persist. Leaving `seat_numbers` as
+    None (the default) behaves exactly as before this parameter existed —
+    `ticket_count` is validated as a plain quantity — so existing callers are
+    unaffected.
 
-    Meal counts are validated the same way, under "food_count": veg_count +
-    non_veg_count must equal ticket_count exactly, so the booking doubles as
-    a per-person meal tally for catering and a mismatch (too few or too many
-    meals for the tickets bought) is caught here rather than discovered at
-    the buffet.
+    Guest names are validated AGAINST the (possibly seat-derived) ticket
+    count: a booking of N tickets is the registrant plus N-1 other people, so
+    exactly N-1 additional names are required (see
+    additional_guests_expected). Names used to be free-form and optional,
+    which meant a 6-ticket booking could arrive with nobody named — the
+    organiser then had no idea who the other five people were, and the door
+    had no list to check against. Requiring them here is the only point in
+    the flow where the guest is still present to answer.
 
     This replaces the validation that used to be duplicated twice in
     streamlit_app.page_register (once inside the st.form block, once after
@@ -2418,39 +2780,38 @@ def validate_registration(
     # this, but it is a client-side widget and this function is the server
     # -side authority — a garbage value must produce a fixable message, not
     # a traceback out of int().
+    #
+    # When seat_numbers is provided it is the authority instead: the
+    # picked seats ARE the booking, so the derived ticket count is simply how
+    # many seats were validly picked, and the plain `ticket_count` argument
+    # above is ignored entirely.
     max_tickets = config.MAX_TICKETS_PER_REGISTRATION
-    try:
-        tickets_clean = int(ticket_count)
-    except (TypeError, ValueError):
-        tickets_clean = 0
-    if tickets_clean < 1 or tickets_clean > max_tickets:
-        errors["ticket_count"] = f"Please choose between 1 and {max_tickets} tickets."
-        tickets_clean = min(max(tickets_clean, 1), max_tickets)
-
-    # Meal preferences are collected for catering planning. Food is available
-    # for purchase at the venue, so veg + non-veg may be anywhere from 0 up to
-    # the number of tickets bought — but never more than the party size.
-    try:
-        veg_clean = int(veg_count)
-    except (TypeError, ValueError):
-        veg_clean = 0
-    try:
-        non_veg_clean = int(non_veg_count)
-    except (TypeError, ValueError):
-        non_veg_clean = 0
-    if veg_clean < 0 or non_veg_clean < 0:
-        errors["food_count"] = "Meal counts can't be negative — enter 0 or more for each."
-        veg_clean = max(veg_clean, 0)
-        non_veg_clean = max(non_veg_clean, 0)
-
-    food_total = veg_clean + non_veg_clean
-    if "food_count" not in errors and food_total > tickets_clean:
-        excess = food_total - tickets_clean
-        errors["food_count"] = (
-            f"You have {tickets_clean} ticket{'s' if tickets_clean != 1 else ''} but entered "
-            f"{food_total} meals ({veg_clean} veg + {non_veg_clean} non-veg). "
-            f"Please remove {excess} {'meal' if excess == 1 else 'meals'}."
-        )
+    seats_clean = None
+    if seat_numbers is not None:
+        parsed_seats, seat_reason = parse_seat_selection(seat_numbers)
+        if seat_reason == "invalid":
+            errors["seat_numbers"] = "Please select valid seat numbers."
+        elif seat_reason == "out_of_range":
+            errors["seat_numbers"] = f"Seats must be between 1 and {config.TOTAL_SEATS}."
+        elif not parsed_seats:
+            errors["seat_numbers"] = "Please select at least one seat."
+        elif len(parsed_seats) > max_tickets:
+            errors["seat_numbers"] = (
+                f"That's more than {max_tickets} seats — please select at most {max_tickets}."
+            )
+        else:
+            seats_clean = parsed_seats
+        if seats_clean is None:
+            seats_clean = []
+        tickets_clean = len(seats_clean)
+    else:
+        try:
+            tickets_clean = int(ticket_count)
+        except (TypeError, ValueError):
+            tickets_clean = 0
+        if tickets_clean < 1 or tickets_clean > max_tickets:
+            errors["ticket_count"] = f"Please choose between 1 and {max_tickets} tickets."
+            tickets_clean = min(max(tickets_clean, 1), max_tickets)
 
     names, names_reason = parse_guest_names(plus_one_name or "")
     expected = additional_guests_expected(tickets_clean)
@@ -2514,9 +2875,10 @@ def validate_registration(
         "additional_guest_count": len(names) if not errors.get("plus_one_name") else 0,
         "zelle_ref": zelle_clean,
         "terms": bool(agree_terms),
-        "veg_count": veg_clean,
-        "non_veg_count": non_veg_clean,
     }
+    if seat_numbers is not None:
+        cleaned["seat_numbers"] = seats_clean
+        cleaned["seat_numbers_str"] = format_seat_numbers(seats_clean)
     return cleaned, errors
 
 
@@ -2527,8 +2889,7 @@ def register_guest(
     ticket_count: int,
     plus_one_name: str,
     zelle_ref: str,
-    veg_count: int = 0,
-    non_veg_count: int = 0,
+    seat_numbers=None,
 ) -> dict:
     """Create a new guest registration.
 
@@ -2537,10 +2898,22 @@ def register_guest(
     caller is responsible for both.
 
     Returns {"ok": True, "guest": {...}} on success, or
-    {"ok": False, "reason": "duplicate_email"|"sold_out"|"not_enough_tickets"|
-    "db_error"|"db_unavailable", "message": str}. The two capacity refusals
-    also carry "remaining" (tickets still available) so the caller can show
-    the guest how many are left.
+    {"ok": False, "reason": "duplicate_email"|"seats_taken"|"sold_out"|
+    "not_enough_tickets"|"db_error"|"db_unavailable", "message": str}. The
+    two ticket-capacity refusals also carry "remaining" (tickets still
+    available); "seats_taken" carries "taken" (the specific conflicting seat
+    numbers) so the caller can show the guest exactly what to re-pick.
+
+    `seat_numbers`, when given (not None), makes this a seat-picking
+    booking: it should already be the normalised list validate_registration()
+    produced (cleaned["seat_numbers"]). The booking's ticket_count becomes
+    len(seat_numbers) — the `ticket_count` argument is ignored — and the
+    seats are persisted via format_seat_numbers(). Crucially, the taken-seats
+    check here happens INSIDE this function's transaction, behind the same
+    _lock_ticket_capacity() advisory lock as the ticket-cap check below: the
+    Register page's availability read is a cached, seconds-stale snapshot,
+    so this in-transaction re-check is the only thing that can actually stop
+    two guests from both claiming the same seat.
     """
     # Refuse to write into the throwaway SQLite fallback: a registration
     # accepted there looks successful, emails a QR code, and then vanishes
@@ -2548,7 +2921,14 @@ def register_guest(
     if db_degraded():
         return {"ok": False, "reason": "db_unavailable", "message": DB_DEGRADED_MESSAGE}
 
-    requested = int(ticket_count) if ticket_count else 1
+    seats_clean = None
+    seats_str = ""
+    if seat_numbers is not None:
+        seats_str = format_seat_numbers(seat_numbers)
+        seats_clean = seat_numbers_list(seats_str)
+        requested = len(seats_clean)
+    else:
+        requested = int(ticket_count) if ticket_count else 1
 
     session = get_db()
     try:
@@ -2567,8 +2947,20 @@ def register_guest(
         # the insert (and behind the advisory lock, so simultaneous submits
         # can't both spend the last seat).
         cap = config.max_total_tickets()
-        if cap > 0:
+        if cap > 0 or seats_clean is not None:
             _lock_ticket_capacity(session)
+
+        if seats_clean is not None:
+            conflict = sorted(set(seats_clean) & taken_seats(session))
+            if conflict:
+                return {
+                    "ok": False,
+                    "reason": "seats_taken",
+                    "message": _seats_taken_message(conflict),
+                    "taken": conflict,
+                }
+
+        if cap > 0:
             remaining = max(0, cap - tickets_sold(session))
             if remaining <= 0:
                 return {"ok": False, "reason": "sold_out", "message": SOLD_OUT_MESSAGE, "remaining": 0}
@@ -2588,8 +2980,7 @@ def register_guest(
             plus_one_name=plus_one_name,
             zelle_ref=zelle_ref,
             qr_code=generate_qr_code(),
-            veg_count=veg_count,
-            non_veg_count=non_veg_count,
+            seat_numbers=seats_str,
         )
         session.add(guest)
         session.commit()
@@ -2751,7 +3142,7 @@ def check_in_by_code(code: str, bypass_window: bool = False) -> dict:
             }
 
         if guest.checked_in:
-            time_str = format_dt(guest.checkin_time, "%H:%M")
+            time_str = format_event_local_dt(guest.checkin_time, "%H:%M")
             return {
                 "status": "already",
                 "guest": guest.to_dict(),
@@ -2802,7 +3193,7 @@ def check_in_guest(guest_id: int, bypass_window: bool = False) -> dict:
             return {"status": "not_found", "guest": None, "message": GUEST_NOT_FOUND_MESSAGE}
 
         if guest.checked_in:
-            time_str = format_dt(guest.checkin_time, "%H:%M")
+            time_str = format_event_local_dt(guest.checkin_time, "%H:%M")
             return {
                 "status": "already",
                 "guest": guest.to_dict(),
@@ -2973,9 +3364,12 @@ def get_recent_checkins(limit: int = 10) -> list:
 
 
 def get_registration_daily_counts() -> list:
-    """Return [(date, count), ...] of registrations per day, oldest first.
+    """Return [(date, count), ...] of registrations per day, oldest first,
+    bucketed by the LOCAL (config.EVENT_TIMEZONE) calendar date.
 
-    Used to drive the admin "registrations by day" bar chart.
+    created_at is stored naive UTC (see _utc_now()); bucketing by the raw
+    UTC date attributes an evening registration (after ~7 PM local) to the
+    following day. Used to drive the admin "registrations by day" bar chart.
     """
     session = get_db()
     try:
@@ -2984,7 +3378,7 @@ def get_registration_daily_counts() -> list:
         for g in guests:
             if not g.created_at:
                 continue
-            day = g.created_at.date()
+            day = to_event_local(g.created_at).date()
             counts[day] = counts.get(day, 0) + (g.ticket_count or 0)
         return sorted(counts.items())
     finally:
@@ -3049,27 +3443,36 @@ def apply_guest_changes(updates: list) -> dict:
 
 
 def get_event_day_hourly_checkins() -> list:
-    """Return a list of 24 ints: check-in count per hour on the event day.
+    """Return a list of 24 ints: check-in count per hour on the event day, in
+    config.EVENT_TIMEZONE.
 
-    Used to drive the admin "check-ins on event day" bar chart.
+    checkin_time is stored naive UTC (see _utc_now()), but door staff and
+    this chart think in local wall-clock hours, and "the event day" is
+    itself a local calendar day. Both halves have to be local: the window
+    is computed as the UTC instants bounding local midnight -> local
+    midnight-next-day (_local_day_utc_bounds), and each row is bucketed by
+    to_event_local(...).hour rather than the raw (UTC) .hour — otherwise an
+    evening check-in lands in the wrong hour, or (once local time crosses
+    into the next UTC day) falls outside the filter window and vanishes
+    from the chart entirely. Used to drive the admin "check-ins on event
+    day" bar chart.
     """
     session = get_db()
     try:
-        event_start = config.EVENT_DATE.replace(hour=0, minute=0, second=0, microsecond=0)
-        event_end = event_start + timedelta(days=1)
+        event_start_utc, event_end_utc = _local_day_utc_bounds(config.EVENT_DATE.date())
         event_checkins = (
             session.query(Guest)
             .filter(
                 Guest.checked_in == True,
-                Guest.checkin_time >= event_start,
-                Guest.checkin_time < event_end,
+                Guest.checkin_time >= event_start_utc,
+                Guest.checkin_time < event_end_utc,
             )
             .all()
         )
         hourly = [0] * 24
         for g in event_checkins:
             if g.checkin_time:
-                hourly[g.checkin_time.hour] += 1
+                hourly[to_event_local(g.checkin_time).hour] += 1
         return hourly
     finally:
         session.close()
@@ -3091,7 +3494,7 @@ _BACKUP_SPECS = (
         Guest,
         ("id", "name", "email", "phone", "ticket_count", "plus_one_name",
          "zelle_ref", "qr_code", "checked_in", "band_given", "checkin_time", "created_at",
-         "veg_count", "non_veg_count"),
+         "veg_count", "non_veg_count", "seat_numbers"),
         "id",
         "One row per registration — contact details, tickets, QR code, check-in state.",
     ),
@@ -3114,7 +3517,7 @@ _BACKUP_SPECS = (
         SubmissionLog,
         ("id", "name", "email", "phone", "ticket_count", "plus_one_name",
          "zelle_ref", "status", "errors", "guest_id", "created_at",
-         "veg_count", "non_veg_count"),
+         "veg_count", "non_veg_count", "seat_numbers"),
         "id",
         "Every registration attempt — successful or not — with its failure reason.",
     ),

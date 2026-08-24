@@ -419,10 +419,12 @@ div[data-testid="stContainer"] {
     pointer-events: none;
 }
 .hero-title {
+    /* Demoted to a small "presented by" eyebrow line — see the
+       .hero-event-name comment below for why. */
     font-family: 'Tunga', 'Bitter', Georgia, serif;
-    font-size: 2.1rem;
+    font-size: 1.05rem;
     font-weight: 400;
-    margin: 0 0 10px 0;
+    margin: 0 0 6px 0;
     background: linear-gradient(180deg, var(--gold-soft) 0%, var(--gold) 55%, var(--gold-dark) 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
@@ -435,12 +437,25 @@ div[data-testid="stContainer"] {
        background-clip. */
     filter: drop-shadow(0 2px 0 rgba(0, 0, 0, 0.55));
 }
-.hero-subtitle {
+/* The actual event name (config.EVENT_SUBTITLE, e.g. "Prasanga — Sri Devi
+   Mahathme") — the headline of the banner. A guest arriving from the flyer
+   is here for THIS specific performance, not primarily to learn who the
+   presenting org is, so it now leads visually: the largest, boldest text
+   on the banner, ahead of .hero-title above it. .hero-title used to be
+   bigger (2.1rem vs 1.3rem here) despite the docstring's stated intent that
+   this line "outrank" everything below it — it never actually outranked
+   the org name itself, so the org name (not the performance) was what a
+   guest's eye landed on first. Swapped: .hero-title is now a compact
+   eyebrow ("presented by DFW Yakshagana Havyasis") and this is the title. */
+.hero-event-name {
     font-family: 'Bitter', Georgia, serif;
-    font-size: 1.1rem;
-    color: var(--gold-soft);
-    font-weight: 700;
-    margin-bottom: 2px;
+    font-size: 2rem;
+    color: var(--gold);
+    font-weight: 800;
+    line-height: 1.25;
+    letter-spacing: 0.2px;
+    margin-bottom: 8px;
+    text-shadow: 0 2px 0 rgba(0, 0, 0, 0.45);
 }
 /* The Kannada line from the event branding. Kannada has taller stacked
    glyphs than Latin, so it gets its own line-height and a dedicated Kannada
@@ -451,15 +466,36 @@ div[data-testid="stContainer"] {
     color: var(--tan);
     font-weight: 600;
     line-height: 1.9;
+    margin-bottom: var(--space-2);
+}
+/* The org's mission tagline (config.EVENT_TAGLINE) — demoted to small
+   supporting text under the event name and Kannada line, not competing
+   with either for attention. */
+.hero-tagline {
+    font-family: 'Inter', sans-serif;
+    font-size: 0.82rem;
+    color: var(--text-dim);
+    font-weight: 600;
+    line-height: 1.4;
     margin-bottom: var(--space-3);
 }
-/* Event theme badge — the loudest thing after the title, because it is the
-   one instruction a guest has to act on before they arrive. */
+/* Event theme badge — the loudest thing after the event name, because it is
+   the one instruction a guest has to act on before they arrive. Pill (name)
+   and note (dress-code detail) are stacked as separate block elements
+   inside a column wrapper rather than crammed into one flex row, so each
+   wraps on its own at narrow widths instead of the pill shrink-wrapping
+   into a cramped, lopsided two-line badge. */
+.hero-theme-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    margin: 0 0 var(--space-3) 0;
+}
 .hero-theme {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    margin: 0 0 var(--space-3) 0;
     padding: 7px 18px;
     border-radius: var(--radius-pill);
     background: linear-gradient(180deg, rgba(var(--rust-rgb), 0.55) 0%, rgba(var(--rust-rgb), 0.30) 100%);
@@ -470,14 +506,17 @@ div[data-testid="stContainer"] {
     font-size: 0.95rem;
     letter-spacing: 0.04em;
     text-transform: uppercase;
+    white-space: nowrap;
 }
-.hero-theme small {
+.hero-theme-note {
     font-family: 'Inter', sans-serif;
     font-weight: 600;
-    text-transform: none;
-    letter-spacing: normal;
+    font-size: 0.82rem;
     color: var(--gold-soft);
     opacity: 0.9;
+    text-align: center;
+    line-height: 1.4;
+    max-width: 320px;
 }
 .hero-badges {
     display: flex;
@@ -487,8 +526,9 @@ div[data-testid="stContainer"] {
 }
 
 @media (max-width: 640px) {
-    .hero-title { font-size: 1.7rem !important; }
-    .hero-subtitle { font-size: 0.95rem !important; }
+    .hero-title { font-size: 0.85rem !important; }
+    .hero-event-name { font-size: 1.5rem !important; }
+    .hero-theme { font-size: 0.85rem !important; padding: 6px 14px !important; }
 }
 
 /* ── Event strip (Register page) ───────────────────────────────────────── */
@@ -510,6 +550,20 @@ div[data-testid="stContainer"] {
     border-radius: var(--radius-md);
     font-size: 0.9rem;
     color: var(--text-dim);
+}
+/* The performance's own name (config.EVENT_SUBTITLE) — a heading ABOVE the
+   chip strip, not another chip inside it. See theme.event_strip()'s
+   docstring for why: it used to reuse .event-strip-date's plain text-dim
+   styling plus a 🎭 duplicated from the dress-theme chip a few items over,
+   so it read as one more metadata pill instead of the event's title. */
+.event-strip-title {
+    font-family: 'Bitter', Georgia, serif;
+    font-weight: 800;
+    font-size: 1.1rem;
+    color: var(--gold);
+    text-align: center;
+    line-height: 1.3;
+    margin: 0 0 var(--space-2) 0;
 }
 .event-strip-venue { min-width: 0; }
 .event-strip-theme {
@@ -843,33 +897,48 @@ div[data-testid="stContainer"] {
 /* ── Event flyer ───────────────────────────────────────────────────────── */
 /* Framed like a festival poster on a temple notice board: gold edge,
    stitched inner rule, and a height cap so a tall portrait poster stays a
-   glance rather than a wall you have to scroll past. */
+   glance rather than a wall you have to scroll past. On Home this is meant
+   to read as the centrepiece of the page — thicker gold edge and a glow
+   (shadow-gold-lg, the same treatment as the hero banner) rather than the
+   flatter shadow-md an ordinary card gets — so raise the height cap
+   accordingly instead of leaving the artwork visibly capped short. */
 .flyer-card {
     position: relative;
     display: flex;
-    justify-content: center;
-    padding: var(--space-4);
-    margin: 0 0 var(--space-5) 0;
-    background: linear-gradient(180deg, rgba(var(--leather-rgb), 0.22) 0%, var(--elevated) 100%);
-    border: 2px solid rgba(var(--gold-rgb), 0.40);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-md);
+    flex-direction: column;
+    align-items: center;
+    padding: var(--space-5);
+    margin: 0 0 var(--space-6) 0;
+    background: linear-gradient(180deg, rgba(var(--leather-rgb), 0.28) 0%, var(--elevated) 100%);
+    border: 3px solid rgba(var(--gold-rgb), 0.55);
+    border-radius: var(--radius-xl);
+    box-shadow: var(--shadow-gold-lg);
 }
 .flyer-card::before {
     content: "";
     position: absolute;
-    inset: 6px;
-    border: 1px dashed rgba(var(--tan-rgb), 0.35);
-    border-radius: calc(var(--radius-lg) - 4px);
+    inset: 8px;
+    border: 1px dashed rgba(var(--tan-rgb), 0.4);
+    border-radius: calc(var(--radius-xl) - 4px);
     pointer-events: none;
 }
 .flyer-card img {
     max-width: 100%;
-    max-height: 70vh;
+    max-height: 85vh;
     width: auto;
     height: auto;
-    border-radius: var(--radius-sm);
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+    border-radius: var(--radius-md);
+    box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5);
+    position: relative;
+}
+.flyer-caption {
+    position: relative;
+    margin-top: var(--space-3);
+    font-family: 'Bitter', Georgia, serif;
+    font-size: 0.92rem;
+    font-weight: 700;
+    color: var(--gold-soft);
+    text-align: center;
 }
 
 /* ── Photo gallery (Home) ──────────────────────────────────────────────── */
@@ -1137,6 +1206,22 @@ a.sponsor-card:hover {
     color: var(--text);
     box-shadow: inset 3px 0 0 var(--gold);
 }
+/* Bolder summary row appended when price_tier_table() is given a total —
+   makes the payment card self-sufficient so the real amount to Zelle is
+   visible without scrolling to total_card() further down the page. */
+.tier-total {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: 12px var(--space-4);
+    border-top: 2px solid var(--gold);
+    background: rgba(var(--gold-rgb), 0.14);
+    color: var(--text);
+    font-size: 1rem;
+    font-weight: 800;
+}
+.tier-total span:last-child { color: var(--gold); }
 .tier-range { font-weight: 600; }
 .tier-price {
     font-weight: 800;
@@ -1148,14 +1233,6 @@ a.sponsor-card:hover {
     font-weight: 600;
     font-size: 0.8rem;
     color: var(--text-dimmer);
-}
-
-/* Savings line inside the Total to Pay card. */
-.total-savings {
-    margin-top: 8px;
-    font-size: 0.9rem;
-    font-weight: 700;
-    color: var(--ok);
 }
 
 /* "One more ticket unlocks the next tier" hint, under the total. */
@@ -1237,8 +1314,24 @@ a.sponsor-card:hover {
 }
 .seat-row {
     display: flex;
+    align-items: center;
     justify-content: center;
     gap: 5px;
+}
+/* Row-letter gutter at the start of each row, like a real venue seating
+   chart. Fixed width so every row's seats line up under each other
+   regardless of whether the row letter is one character ("A") or two
+   ("AA", past row 26) — see config.SEAT_ROW_LETTERS. */
+.seat-row-label {
+    flex: 0 0 16px;
+    width: 16px;
+    text-align: right;
+    padding-right: 4px;
+    font-family: 'Bitter', Georgia, serif;
+    font-weight: 800;
+    font-size: 0.68rem;
+    color: var(--gold-soft);
+    opacity: 0.85;
 }
 .seat {
     width: 26px;
@@ -1274,6 +1367,16 @@ a.sponsor-card:hover {
     box-shadow: 0 0 0 2px var(--text), 0 0 12px rgba(var(--gold-rgb), 0.55);
     color: #000;
 }
+/* TAKEN: visibly unavailable, not just "a different tier" — muted, flat,
+   dashed border, reduced opacity, and the pointer says "no" too. */
+.seat-taken {
+    background: var(--surface-2);
+    border: 1px dashed var(--border-strong);
+    color: var(--text-dimmer);
+    opacity: 0.45;
+    box-shadow: none;
+    cursor: not-allowed;
+}
 .seat-legend {
     display: flex;
     flex-wrap: wrap;
@@ -1301,6 +1404,18 @@ a.sponsor-card:hover {
 }
 
 /* ── Seat price breakdown (subtotals per tier) ─────────────────────────── */
+.seat-note {
+    margin-top: var(--space-3);
+    padding: 10px var(--space-3);
+    border-radius: var(--radius-sm);
+    background: rgba(var(--tan-rgb), 0.10);
+    border: 1px dashed rgba(var(--tan-rgb), 0.35);
+    color: var(--text-dim);
+    font-size: 0.82rem;
+    line-height: 1.45;
+    text-align: center;
+}
+.seat-note strong { color: var(--gold-soft); }
 .seat-breakdown {
     background: rgba(0, 0, 0, 0.22);
     border: 1px solid rgba(var(--gold-rgb), 0.18);
@@ -1323,15 +1438,26 @@ a.sponsor-card:hover {
 }
 
 @media (max-width: 480px) {
+    /* A 10-across row of 3-digit seat numbers still has to fit a ~360px
+       phone content width (10 cells + 9 gaps + the aisle gap), but the
+       previous 20px/0.48rem cells were too small to actually read a seat
+       number at a glance — this is as large as the row can go without
+       overflowing at 430px. */
     .seat {
-        width: 20px;
-        height: 20px;
-        font-size: 0.48rem;
+        width: 25px;
+        height: 25px;
+        font-size: 0.62rem;
         border-radius: 3px 3px 6px 6px;
     }
     .seat.aisle { margin-right: 10px; }
-    .seat-row { gap: 3px; }
-    .seat-grid { gap: 5px; }
+    .seat-row { gap: 4px; }
+    .seat-grid { gap: 6px; }
+    .seat-row-label {
+        flex: 0 0 12px;
+        width: 12px;
+        padding-right: 2px;
+        font-size: 0.56rem;
+    }
 }
 
 /* ── Guest-names requirement (how many names the ticket count needs) ───── */
@@ -1363,6 +1489,38 @@ a.sponsor-card:hover {
 .guest-req-count {
     font-weight: 800;
     color: var(--gold);
+}
+
+/* ── Seat-selection policy chips (kids free / food at venue) ────────────── */
+/* Two static venue-policy facts a guest must not miss while choosing seats
+   — see theme.seat_policy_chips(). Distinct from .guest-req above (which is
+   live validation on THIS booking's ticket count): these never change with
+   the selection, so they get a calmer, permanent card treatment instead of
+   the info-accent "note" styling. */
+.policy-chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    margin: 0 0 var(--space-4) 0;
+}
+.policy-chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1 1 220px;
+    background: var(--ok-bg);
+    border: 1px solid var(--ok-border);
+    border-radius: var(--radius-md);
+    padding: 10px var(--space-4);
+    font-size: 0.88rem;
+    font-weight: 600;
+    color: var(--text);
+    line-height: 1.35;
+}
+.policy-chip-icon {
+    font-size: 1.15rem;
+    line-height: 1;
+    flex-shrink: 0;
 }
 
 /* ── Venue info card ──────────────────────────────────────────────────── */
@@ -1759,14 +1917,29 @@ def brand_bar() -> str:
 
 
 def hero() -> str:
-    """The homepage hero banner: title, taglines, dress theme, and the
-    date/time/venue badge row.
+    """The homepage hero banner: org name, event name, taglines, dress
+    theme, and the date/time/venue badge row.
 
     Mirrors the printed flyer, because most guests arrive here straight from
-    it: event name, tagline, optional local-language subtitle, and the dress
-    theme called out as its own badge — that last one is the only thing on
-    this banner a guest has to *do* something about before the event, so it is
-    not buried in the badge row.
+    it. Hierarchy, top to bottom: a small "presented by" eyebrow line for
+    the ORGANISATION name (`.hero-title`, config.EVENT_NAME — who is
+    putting this on), then the actual EVENT/performance name as the
+    HEADLINE (`.hero-event-name`, config.EVENT_SUBTITLE, e.g. "Sri Devi
+    Mahathme" — what a guest is actually being invited to, so it is the
+    largest, boldest text on the banner), then the Kannada tagline, then the
+    org's mission tagline demoted to small supporting text
+    (`.hero-tagline`, config.EVENT_TAGLINE). Earlier versions reused one
+    `.hero-subtitle` class for both the org tagline AND the event name,
+    which made the actual event a guest is being invited to visually
+    indistinguishable from — and secondary to — the org's mission
+    statement. Each now has its own class so weight matches importance; the
+    org name (`.hero-title`) intentionally renders SMALLER than the
+    performance name below it, not just smaller than the tagline, since the
+    performance is the headline and the org is context.
+
+    The dress theme gets its own badge — the one thing on this banner a
+    guest has to *do* something about before the event, so it is not buried
+    in the badge row.
 
     The countdown itself lives only in the sticky brand bar (always visible
     while scrolling) — it's intentionally not repeated here to avoid showing
@@ -1778,20 +1951,34 @@ def hero() -> str:
     theme_name = html.escape(getattr(config, "EVENT_THEME", "") or "")
     theme_note = html.escape(getattr(config, "EVENT_THEME_NOTE", "") or "")
     if theme_name:
-        note_html = f" <small>· {theme_note}</small>" if theme_note else ""
-        theme_html = f'<div class="hero-theme">🎭 {theme_name} Theme{note_html}</div>'
+        # The pill (name) and the note (dress-code detail) are separate
+        # block-level elements, not one flex row sharing a single pill —
+        # cramming both into one `<div class="hero-theme">` used to force
+        # the browser to shrink-wrap two flex items independently at narrow
+        # widths, producing a lopsided two-line pill. Stacked, each wraps
+        # cleanly on its own line instead.
+        note_html = f'<div class="hero-theme-note">{theme_note}</div>' if theme_note else ""
+        theme_html = (
+            '<div class="hero-theme-wrap">'
+            f'<span class="hero-theme">🎭 {theme_name} Theme</span>'
+            f'{note_html}'
+            '</div>'
+        )
     else:
         theme_html = ""
 
-    subtitle = html.escape(getattr(config, "EVENT_SUBTITLE", "") or "")
-    subtitle_html = f'<div class="hero-subtitle">{subtitle}</div>' if subtitle else ""
+    event_name = html.escape(getattr(config, "EVENT_SUBTITLE", "") or "")
+    event_name_html = f'<div class="hero-event-name">{event_name}</div>' if event_name else ""
+
+    event_tagline = html.escape(config.EVENT_TAGLINE)
+    tagline_html = f'<div class="hero-tagline">{event_tagline}</div>' if config.EVENT_TAGLINE else ""
 
     return f"""
     <div class="hero-banner">
         <div class="hero-title">{html.escape(config.EVENT_NAME)}</div>
-        <div class="hero-subtitle">{html.escape(config.EVENT_TAGLINE)}</div>
-        {subtitle_html}
+        {event_name_html}
         {local_html}
+        {tagline_html}
         {theme_html}
         <div class="hero-badges">
             <span class="badge">📅 {html.escape(config.EVENT_DATE_TEXT)}</span>
@@ -1805,25 +1992,34 @@ def hero() -> str:
 
 
 def event_strip() -> str:
-    """A compact date / venue / dress-theme strip for the Register page.
+    """The performance title, plus a compact date / venue / dress-theme chip
+    strip, for the Register page.
 
     Register is the landing page, so for most guests it is the *only* page
     they see — and they arrive on it straight from the flyer, mid-decision,
     about to send money. The three things they need confirmed before that
     (is this the right party, where is it, what do I wear) live on Home's
     hero, which they may never reach. This restates them in one line.
+
+    The performance name (config.EVENT_SUBTITLE) renders as its own heading
+    ABOVE the chip strip, in `.event-strip-title` — not as one more `<span>`
+    chip inside `.event-strip` alongside the date/venue/theme. It used to
+    reuse `.event-strip-date`'s plain metadata styling and lead with a 🎭
+    emoji that duplicated the dress-theme chip's own 🎭 a few chips over,
+    which made a guest arriving from the flyer read it as just another
+    logistics pill instead of the title of what they are attending.
     """
     theme_name = html.escape(getattr(config, "EVENT_THEME", "") or "")
     theme_html = (
         f'<span class="event-strip-theme">🎭 {theme_name} Theme</span>' if theme_name else ""
     )
     subtitle = html.escape(getattr(config, "EVENT_SUBTITLE", "") or "")
-    subtitle_html = f'<span class="event-strip-date">🎭 {subtitle}</span>' if subtitle else ""
+    title_html = f'<div class="event-strip-title">{subtitle}</div>' if subtitle else ""
     return (
+        f'{title_html}'
         '<div class="event-strip">'
         f'<span class="event-strip-date">📅 {html.escape(config.EVENT_DATE_SHORT)}'
         f' · {html.escape(config.EVENT_TIME_TEXT)}</span>'
-        f'{subtitle_html}'
         f'<span class="event-strip-venue">📍 {html.escape(config.VENUE_NAME)}, {html.escape(config.VENUE_ADDRESS)}</span>'
         f'{theme_html}'
         '</div>'
@@ -2018,20 +2214,30 @@ def nav_card(icon: str, title: str, desc: str) -> str:
     )
 
 
-def flyer_card(src: str, alt: str = "") -> str:
+def flyer_card(src: str, alt: str = "", caption: str = "") -> str:
     """The event flyer, framed, or "" when there isn't one configured.
 
     Height-capped rather than width-capped: the flyer is a tall portrait
     poster, and left to fill a desktop column it would push everything below
     it off the screen. Capping the height keeps it a glance, not a wall.
+
+    `caption`, when given, renders as a short line under the poster tying it
+    to the event (e.g. the event name and date) — optional so the Register
+    page's collapsed-expander flyer can render without one. Must still
+    return "" for a blank `src` regardless of `caption`, so a caller can
+    build a caption unconditionally and rely on this to drop it along with
+    everything else when there's no flyer configured.
     """
     src = (src or "").strip()
     if not src:
         return ""
     alt = alt or f"{config.EVENT_NAME} event flyer"
+    caption = (caption or "").strip()
+    caption_html = f'<div class="flyer-caption">{html.escape(caption)}</div>' if caption else ""
     return (
         '<div class="flyer-card">'
         f'<img src="{html.escape(src, quote=True)}" alt="{html.escape(alt, quote=True)}" loading="lazy">'
+        f'{caption_html}'
         "</div>"
     )
 
@@ -2154,7 +2360,7 @@ def sponsor_wall(sponsors: list) -> str:
 
 def registration_confirmation(
     name: str, email: str, tickets: int, guest_names: list,
-    veg_count: int = 0, non_veg_count: int = 0,
+    seat_numbers=None,
 ) -> str:
     """The "you're in" card shown at the top of Home right after a submit.
 
@@ -2162,10 +2368,16 @@ def registration_confirmation(
     sponsors, and party stats — but the confirmation has to travel with
     them, or a submit would look like it did nothing. Reads the booking
     back from what was actually saved so this doubles as the guest's last
-    chance to spot a missing name before the door.
+    chance to spot a missing name — or a missing seat — before the door.
 
     The QR email is fire-and-forget (utils.send_qr_email_async), so the
     wording here says it is on its way, never that it arrived (see PART 1).
+
+    `seat_numbers` is the guest's actual held seats (e.g. guest["seats"], a
+    list of ints) — this is the guest's receipt, so it must say which seats
+    they hold, in the venue-style labels (config.seat_label()) they picked
+    on the seat map — not the raw stored integers. Omitted (or empty) skips
+    the row, matching a legacy booking with no seat numbers on file.
     """
     try:
         tickets = int(tickets)
@@ -2174,20 +2386,20 @@ def registration_confirmation(
     guest_names = [str(n).strip() for n in (guest_names or []) if str(n).strip()]
     plural = "s" if tickets != 1 else ""
 
-    try:
-        veg_count = int(veg_count)
-    except (TypeError, ValueError):
-        veg_count = 0
-    try:
-        non_veg_count = int(non_veg_count)
-    except (TypeError, ValueError):
-        non_veg_count = 0
+    seats = []
+    for s in (seat_numbers or []):
+        try:
+            seats.append(int(s))
+        except (TypeError, ValueError):
+            continue
+    seats = sorted(set(seats))
 
     rows = [
         ("Tickets", f"{tickets} ticket{plural}"),
-        ("Meals", f"{veg_count} veg, {non_veg_count} non-veg"),
         ("QR code emailed to", email or "—"),
     ]
+    if seats:
+        rows.insert(1, ("Seats", config.format_seat_labels(seats)))
     if guest_names:
         rows.append((f"Additional guests ({len(guest_names)})", ", ".join(guest_names)))
         rows.append(("On this booking", f"{len(guest_names) + 1} people, including you"))
@@ -2227,14 +2439,21 @@ def tier_range_label(tier: dict) -> str:
     return f"{low}–{high}"
 
 
-def price_tier_table(tiers: list, ticket_count: int = 0) -> str:
-    """The group-discount price table, shown inside the payment card.
+def price_tier_table(tiers: list, ticket_count: int = 0, total_cents: int = None) -> str:
+    """The seat-price table, shown inside the payment card.
 
     `tiers` is a config.price_tiers() payload. `ticket_count` highlights the
     row the current selection falls into — the point of showing the whole
     table on the form is that a guest can see both what they're paying and
-    what one more ticket would get them, so the row they're on has to be
+    what one more seat would get them, so the row they're on has to be
     unmistakable.
+
+    Each seat is priced individually (see config.booking_total_cents) — this
+    is NOT a per-booking group-discount rate, so the copy must never read as
+    "N tickets cost $X each" (that reads as N × $X, which is wrong). When
+    `total_cents` is given and `ticket_count` is at least 1, a footer row is
+    appended showing the real amount to send, so this table can't be
+    misread as the total on its own.
     """
     if not tiers:
         return ""
@@ -2252,29 +2471,53 @@ def price_tier_table(tiers: list, ticket_count: int = 0) -> str:
         price = int(tier.get("price_cents", 0)) / 100
         rows.append(
             f'<div class="tier-row{" is-active" if active else ""}">'
-            f'<span class="tier-range">{html.escape(tier_range_label(tier))} '
-            f'{"ticket" if low == 1 and high == 1 else "tickets"}</span>'
-            f'<span class="tier-price">${price:,.2f} <span class="tier-each">each</span></span>'
+            f'<span class="tier-range">Seats {html.escape(tier_range_label(tier))}</span>'
+            f'<span class="tier-price">${price:,.2f} <span class="tier-each">per seat</span></span>'
             "</div>"
         )
+
+    total_html = ""
+    if total_cents is not None and count >= 1:
+        try:
+            total = int(total_cents) / 100
+        except (TypeError, ValueError):
+            total = None
+        if total is not None:
+            plural = "s" if count != 1 else ""
+            total_html = (
+                '<div class="tier-total">'
+                f'<span>Your {count} seat{plural}</span>'
+                f'<span>${total:,.2f} to send</span>'
+                "</div>"
+            )
+
     return (
         '<div class="tier-table">'
-        '<div class="tier-table-head">🎟️ Group pricing — the more tickets on one '
-        "booking, the less each one costs</div>"
+        '<div class="tier-table-head">🎟️ Seat pricing — every seat has its own price, '
+        "and your total is the sum of the seats you take</div>"
         f'{"".join(rows)}'
+        f"{total_html}"
         "</div>"
     )
 
 
-def payment_card(zelle_info: str, tiers: list, ticket_count: int = 0) -> str:
+def payment_card(zelle_info: str, tiers: list, ticket_count: int = 0, total_cents: int = None) -> str:
     """The Zelle payment instructions card shown on the Register page.
 
-    Carries the full group-discount table rather than a single price,
-    because this card sits ABOVE the ticket selector: at the point a guest
-    reads it they haven't chosen a quantity yet, and the whole reason to
-    show tiers here is to let the price influence that choice. The exact
-    amount for the quantity they land on is restated by total_card() below
-    the selector.
+    Carries the full seat-price table rather than a single price, because
+    this card sits ABOVE the ticket selector: at the point a guest reads it
+    they haven't necessarily settled on a quantity yet, and showing every
+    tier lets the price influence that choice. When `total_cents` is given,
+    price_tier_table() also appends the exact amount to send for
+    `ticket_count` seats, so a guest who pays right from this card — without
+    scrolling down to total_card() below the selector — still sees the real
+    total rather than a per-seat rate they might multiply themselves.
+
+    The kids-free / food-at-venue facts used to be a couple of sentences
+    tacked onto the end of this paragraph, where they were easy to skim
+    past. They now live in their own chips next to the seat picker (see
+    seat_policy_chips()) instead — this card stays focused on the Zelle
+    mechanics.
     """
     return f"""
     <div class="payment-card">
@@ -2283,42 +2526,57 @@ def payment_card(zelle_info: str, tiers: list, ticket_count: int = 0) -> str:
             <span class="payment-title">Step 1: Pay via Zelle</span>
         </div>
         <p class="payment-desc">
-            Before registering, send your payment via Zelle in your banking app.
+            Send the <strong>exact total shown below</strong> via Zelle in your banking app —
+            seats are priced individually, so the total is not one seat's price times your count.
             You'll need the <strong>transaction confirmation number</strong> on the next step.
-            <br><br>
-            <strong>Kids under age 12 are FREE</strong> — do not buy them a seat.
-            Food will be available for purchase at the venue.
         </p>
         <div class="zelle-box">
             <div class="zelle-label">Send Zelle To</div>
             <div class="zelle-email">{html.escape(zelle_info)}</div>
         </div>
-        {price_tier_table(tiers, ticket_count)}
+        {price_tier_table(tiers, ticket_count, total_cents)}
     </div>
     """
 
 
-def total_card(tickets: int, total_cents: int, savings: float = 0.0) -> str:
+def seat_policy_chips() -> str:
+    """Two facts a guest choosing seats must not miss: kids under 12 are
+    free, and food is available for purchase at the venue.
+
+    Both strings live once in config.py (KIDS_POLICY_TEXT / FOOD_POLICY_TEXT)
+    so this file never hand-types event policy — see the VENUE_* constants
+    venue_info_card() reads for the same rule. Rendered as its own small
+    chip row next to the seat picker rather than folded into payment_card()'s
+    prose, which a guest focused on picking seats could skim right past.
+    """
+    kids = html.escape(config.KIDS_POLICY_TEXT)
+    food = html.escape(config.FOOD_POLICY_TEXT)
+    return (
+        '<div class="policy-chip-row">'
+        f'<div class="policy-chip"><span class="policy-chip-icon">🧒</span><span>{kids}</span></div>'
+        f'<div class="policy-chip"><span class="policy-chip-icon">🍽️</span><span>{food}</span></div>'
+        '</div>'
+    )
+
+
+def total_card(tickets: int, total_cents: int) -> str:
     """The live-updating 'Total to Pay' card on the Register page.
 
-    `total_cents` is the exact amount to Zelle for the selected seats.
-    `savings` is what the guest saved vs the base price, shown only when > 0.
+    `total_cents` is the exact amount to Zelle for the selected seats. There
+    is no savings/discount line: seats are picked individually now (see
+    config.seats_total_cents), so a guest's total is simply the sum of the
+    specific seats they hold — there is no "vs base price" comparison that
+    means anything for an arbitrary pick, and no screen may claim a discount
+    that isn't real.
     """
     tickets = int(tickets)
     total = total_cents / 100
     plural = "s" if tickets != 1 else ""
-    savings_html = (
-        f'<div class="total-savings">🎉 Tiered seating discount — you save '
-        f"${savings:,.2f}</div>"
-        if savings > 0
-        else ""
-    )
     return f"""
     <div class="total-card">
         <div class="total-label">Total to Pay</div>
         <div class="total-value">${total:,.2f}</div>
         <div class="total-caption">{tickets} seat{plural} selected</div>
-        {savings_html}
     </div>
     """
 
@@ -2344,48 +2602,98 @@ def next_tier_nudge(ticket_count: int, tier: dict, base_price_cents: int) -> str
         '<div class="tier-nudge">'
         "<span class=\"tier-nudge-icon\">💡</span>"
         f"<span>Seat <strong>{next_seat}</strong> and above cost "
-        f"<strong>${tier_price:,.2f}</strong> each. "
+        f"<strong>${tier_price:,.2f}</strong> per seat. "
         "Everyone coming needs their own ticket and their name below.</span>"
         "</div>"
     )
 
 
-def seat_map(ticket_count: int, max_seats: int = 100) -> str:
-    """Visual sanctuary-style seat map. Seats 1..ticket_count are highlighted.
+def seat_map(selected=(), taken=(), max_seats: int = None) -> str:
+    """Visual sanctuary-style seat map: every seat renders in exactly one of
+    three states — TAKEN (already booked by someone else), SELECTED (this
+    guest's own pick), or AVAILABLE (tier-coloured, open to pick).
 
-    Seats are colour-coded by price tier. The map is purely visual — the
-    actual selection happens via the slider above it — and is styled like
-    rows of chairs in the Unity of Dallas Sanctuary rather than a cinema.
+    `selected` is the seat numbers this guest currently has chosen;
+    `taken` is every seat number already sold to someone else (see
+    utils.seat_availability()). `max_seats` defaults to config.TOTAL_SEATS.
+    Seats are colour-coded by price tier via config.seat_tier_index(), so the
+    map can never drift from config.SEAT_TIERS. The map is purely visual —
+    the actual selection happens via the multiselect above it.
+
+    Each row starts with a row-letter gutter (config.seat_row_label()) so the
+    grid reads like a real venue seating chart, and every seat cell shows its
+    full venue-style label (config.seat_label(), e.g. "B7") rather than the
+    bare stored integer — that raw integer stays the DB/internal identity,
+    this is display only.
+
+    A seat can never render as both taken and selected: if the two sets
+    somehow overlap (e.g. a stale selection the caller hasn't pruned yet),
+    TAKEN wins — real inventory outranks a page that hasn't caught up yet.
     """
-    try:
-        count = max(0, min(int(ticket_count), max_seats))
-    except (TypeError, ValueError):
-        count = 0
-
     import config as _config
 
-    # Build tier lookup: seat_number -> css class suffix
-    tier_class = {}
-    tier_colors = ["gold", "tan", "turquoise"]
-    for idx, (start, end, price) in enumerate(_config.SEAT_TIERS):
-        cls = tier_colors[idx % len(tier_colors)]
-        for s in range(start, min(end, max_seats) + 1):
-            tier_class[s] = cls
+    if max_seats is None:
+        max_seats = _config.TOTAL_SEATS
+    try:
+        max_seats = int(max_seats)
+    except (TypeError, ValueError):
+        max_seats = _config.TOTAL_SEATS
+    max_seats = max(0, max_seats)
 
-    cols = 10
+    def _clean(values):
+        cleaned = set()
+        for v in values or ():
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= n <= max_seats:
+                cleaned.add(n)
+        return cleaned
+
+    taken_set = _clean(taken)
+    selected_set = _clean(selected) - taken_set
+
+    tier_colors = ["gold", "tan", "turquoise"]
+
+    cols = getattr(_config, "SEAT_COLS", 10) or 10
+    try:
+        cols = int(cols)
+    except (TypeError, ValueError):
+        cols = 10
+    cols = max(1, cols)
     rows = (max_seats + cols - 1) // cols
     cells = []
     for seat in range(1, max_seats + 1):
-        cls = tier_class.get(seat, "")
-        selected = " selected" if seat <= count else ""
+        label = html.escape(_config.seat_label(seat))
+        tier_idx = _config.seat_tier_index(seat)
+        cls = tier_colors[tier_idx % len(tier_colors)] if tier_idx >= 0 else ""
         # Add an aisle gap between columns 5 and 6.
         aisle = " aisle" if seat % cols == 5 else ""
-        cells.append(
-            f'<div class="seat seat-{cls}{selected}{aisle}"><span>{seat}</span></div>'
-        )
+        if seat in taken_set:
+            cells.append(
+                f'<div class="seat seat-taken{aisle}" '
+                f'aria-label="Seat {label} — already booked" '
+                f'title="Seat {label} — already booked"><span>{label}</span></div>'
+            )
+        elif seat in selected_set:
+            cells.append(
+                f'<div class="seat seat-{cls} selected{aisle}" '
+                f'aria-label="Seat {label} — your seat" '
+                f'title="Seat {label} — selected"><span>{label}</span></div>'
+            )
+        else:
+            price = _config.seat_price_cents(seat) / 100
+            cells.append(
+                f'<div class="seat seat-{cls}{aisle}" '
+                f'aria-label="Seat {label} — ${price:,.2f}, available" '
+                f'title="Seat {label} — ${price:,.2f}"><span>{label}</span></div>'
+            )
 
     grid = "\n".join(
-        '<div class="seat-row">' + "".join(cells[r * cols:(r + 1) * cols]) + "</div>"
+        '<div class="seat-row">'
+        f'<div class="seat-row-label">{html.escape(_config.seat_row_label(r))}</div>'
+        + "".join(cells[r * cols:(r + 1) * cols]) + "</div>"
         for r in range(rows)
     )
 
@@ -2399,36 +2707,67 @@ def seat_map(ticket_count: int, max_seats: int = 100) -> str:
             f'<span>{label}: ${price / 100:,.2f}</span>'
             f'</div>'
         )
+    legend_items.append(
+        '<div class="seat-legend-item">'
+        '<div class="seat-dot seat-taken"></div>'
+        '<span>Taken</span>'
+        '</div>'
+    )
+
+    still_available = max(0, max_seats - len(taken_set) - len(selected_set))
+    plural = "s" if len(selected_set) != 1 else ""
 
     return f"""
     <div class="seat-map-wrap">
         <div class="seat-screen">🙏 Altar</div>
         <div class="seat-grid">{grid}</div>
         <div class="seat-legend">{''.join(legend_items)}</div>
-        <div class="seat-count">{count} of {max_seats} seats selected</div>
+        <div class="seat-count">{len(selected_set)} seat{plural} selected · {still_available} still available</div>
+        <div class="seat-note">
+            These seats are <strong>reserved to your booking</strong> once you submit — greyed-out
+            seats are already booked by someone else. Choose any open seat.
+        </div>
     </div>
     """
 
 
-def seat_breakdown(ticket_count: int) -> str:
-    """Human breakdown of how many seats fall in each tier and the subtotal."""
-    try:
-        count = max(0, int(ticket_count))
-    except (TypeError, ValueError):
-        count = 0
+def seat_breakdown(selected) -> str:
+    """Human breakdown of the guest's ACTUAL picked seats, grouped by tier.
 
+    `selected` is an arbitrary, possibly non-contiguous set of seat numbers
+    (e.g. [1, 2, 90]) — seats are individually picked now, not just the
+    first N, so this groups by which tier each picked seat actually falls
+    in rather than assuming seats 1..N. The tier range is shown in
+    venue-style labels (config.seat_label()), matching what the seat map and
+    multiselect show, e.g. "2 seats in A1–C5 · $100.00" rather than the raw
+    "1–25" a guest would have to translate themselves.
+    """
     import config as _config
+
+    cleaned = set()
+    try:
+        candidates = list(selected or [])
+    except TypeError:
+        candidates = []
+    for seat in candidates:
+        try:
+            n = int(seat)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= _config.TOTAL_SEATS:
+            cleaned.add(n)
 
     lines = []
     for start, end, price in _config.SEAT_TIERS:
-        seats_in_tier = max(0, min(count, end) - start + 1)
-        if seats_in_tier <= 0:
+        seats_in_tier = [s for s in cleaned if start <= s <= end]
+        if not seats_in_tier:
             continue
-        subtotal = seats_in_tier * price
+        subtotal = len(seats_in_tier) * price
+        range_label = f"{_config.seat_label(start)}–{_config.seat_label(end)}"
         lines.append(
             f'<div class="breakdown-line">'
-            f'<span>{seats_in_tier} seat{"s" if seats_in_tier != 1 else ""} '
-            f'({start}–{min(end, count)}):</span>'
+            f'<span>{len(seats_in_tier)} seat{"s" if len(seats_in_tier) != 1 else ""} '
+            f'in {html.escape(range_label)}:</span>'
             f'<span>${subtotal / 100:,.2f}</span>'
             f'</div>'
         )
@@ -2474,50 +2813,14 @@ def guest_names_requirement(ticket_count: int, provided: int = 0) -> str:
     )
 
 
-def food_count_requirement(ticket_count: int, veg_count: int = 0, non_veg_count: int = 0) -> str:
-    """The live note summarising meal preferences for catering planning.
-
-    Food is available for purchase at the venue, so veg + non-veg may be 0 up
-    to ticket_count. The note only flags when more meals are entered than
-    tickets. `ticket_count`, `veg_count`, and `non_veg_count` are all the
-    current widget values (the counters live outside the form, so this
-    re-renders live as they change).
-    """
-    tickets = int(ticket_count)
-    veg = int(veg_count)
-    non_veg = int(non_veg_count)
-    total = veg + non_veg
-
-    if total <= tickets:
-        return (
-            '<div class="guest-req is-solo">'
-            '<span class="guest-req-icon">🍽️</span>'
-            f"<span>{veg} veg, {non_veg} non-veg — planning food for {total} of "
-            f"{tickets} attendees.</span>"
-            "</div>"
-        )
-
-    excess = total - tickets
-    detail = (
-        f"that's {excess} {'meal' if excess == 1 else 'meals'} too many — please remove "
-        f"{'it' if excess == 1 else 'them'}."
-    )
-    return (
-        '<div class="guest-req">'
-        '<span class="guest-req-icon">🍽️</span>'
-        f"<span>{tickets} ticket{'s' if tickets != 1 else ''} cannot need more than "
-        f"<strong>{tickets} meals</strong> — you've entered "
-        f"<span class=\"guest-req-count\">{total}</span> "
-        f"({veg} veg + {non_veg} non-veg), so {html.escape(detail)}</span>"
-        "</div>"
-    )
-
-
 def venue_info_card() -> str:
     """A compact venue info card for the Register page.
 
     Covers parking, arrival time, and house rules so guests have the key
-    logistical details before they complete registration.
+    logistical details before they complete registration. All copy comes
+    from config.py (VENUE_PARKING_TEXT / VENUE_DOORS_TEXT /
+    VENUE_HOUSE_RULE_TEXT) so venue-specific wording lives in one place and
+    VENUE_NAME itself appears only once in the codebase.
     """
     return f"""
     <div class="venue-info-card">
@@ -2531,16 +2834,66 @@ def venue_info_card() -> str:
         </div>
         <div class="venue-info-row">
             <span class="venue-info-label">Parking</span>
-            <span class="venue-info-value">Free parking on the Unity of Dallas campus.</span>
+            <span class="venue-info-value">{html.escape(config.VENUE_PARKING_TEXT)}</span>
         </div>
         <div class="venue-info-row">
             <span class="venue-info-label">Doors</span>
-            <span class="venue-info-value">Doors open before the event; plan to arrive early for parking and seating.</span>
+            <span class="venue-info-value">{html.escape(config.VENUE_DOORS_TEXT)}</span>
         </div>
         <div class="venue-info-row">
             <span class="venue-info-label">House rule</span>
-            <span class="venue-info-value">The building must be cleared by 10:00 PM.</span>
+            <span class="venue-info-value">{html.escape(config.VENUE_HOUSE_RULE_TEXT)}</span>
         </div>
+    </div>
+    """
+
+
+def terms_and_conditions_html() -> str:
+    """The Terms & Conditions / participation waiver shown on the Register
+    page, inside a collapsible expander directly above the "I/We Agree"
+    checkbox.
+
+    Deliberately GENERIC. An earlier version of this text was a party-template
+    alcohol/BYOB disclaimer, which is wrong for a devotional Yakshagana
+    performance at a spiritual centre (config.VENUE_NAME) and a bad look for
+    the organiser. This waiver names no specific substance or activity: it
+    covers assumption of risk, release/indemnity (including travel to and
+    from the venue, and negligence), responsibility for minors, consent to
+    emergency medical treatment, photo/video consent, and a general
+    undertaking to follow the venue's house rules. Keep it that way — house
+    rules belong to the venue, not to this form.
+
+    Pulled out of streamlit_app.py so the copy is unit-testable without a
+    Streamlit runtime, per AGENTS.md ("theme.py: all CSS and HTML component
+    builders"). Every interpolated config value is html.escape()'d.
+    """
+    event_title = f"{html.escape(config.EVENT_NAME)} on {html.escape(config.EVENT_DATE_TEXT)}"
+    organizers = html.escape(config.EVENT_NAME)
+    venue = html.escape(config.VENUE_NAME)
+    return f"""
+    <div style='color: rgba(245,245,245,0.85); font-size: 0.88rem; line-height: 1.5;'>
+        <h4 style='color: #F4E4BC; margin-top: 0;'>Participation Waiver</h4>
+        <p>
+            I (Individual) or We (for all the listed attendees in this form and/or a person who is making group Zelle payment representing the group) the undersigned, hereby voluntarily assume all risks associated with participating in the activities related to the <strong>{event_title}</strong> at {venue}.
+        </p>
+        <p>
+            In consideration of being allowed to participate, I/We hereby release and discharge the {organizers} organizers, their owners, employees, volunteers, and representatives, as well as {venue} and its staff and representatives, from any and all liability for injuries, losses, or damages arising before, during, or after the event — including travel to and from the venue. I/We further agree to indemnify and hold them harmless from any claims arising from my/our participation. This waiver includes, but is not limited to, liability arising from negligence.
+        </p>
+        <p>
+            I/We acknowledge that I am/we are solely responsible for supervising any minors in my/our party at all times during the event.
+        </p>
+        <p>
+            I/We consent to receiving emergency medical treatment deemed necessary in case of injury, accident, or illness during the event.
+        </p>
+        <p>
+            I/We acknowledge that I/We may be photographed or filmed during the event, and I/We grant permission for my/our likeness to be used by the event organizers and sponsors for event-related and promotional purposes without compensation.
+        </p>
+        <p>
+            I/We agree to follow all venue house rules and the directions of the organizers and venue staff at all times, including that the building must be cleared by the posted time.
+        </p>
+        <p>
+            By selecting <strong>"I/We Agree"</strong> below, I/We certify that I/We have read and understood this waiver and release of liability. I/We voluntarily agree to its terms and confirm that my/our participation is entirely voluntary.
+        </p>
     </div>
     """
 
@@ -2722,10 +3075,20 @@ def guest_identity_card(guest: dict, bands: int, status_label: str, status: str 
     except (TypeError, ValueError):
         tickets = 1
 
+    # Door staff need the seat numbers themselves, not just a count — that's
+    # the whole point of a seat being reserved. They're read aloud to
+    # confirm a guest, so they render in the venue-style label
+    # (config.seat_label(), e.g. "B7") a guest actually knows, not the raw
+    # stored integer. Legacy rows registered before seat-picking existed
+    # carry no seat numbers; say so rather than showing a blank.
+    seats = sorted(int(s) for s in (guest.get("seats") or []))
+    seats_value = config.format_seat_labels(seats) if seats else "— (no seats on file)"
+
     rows = [
         ("Email", guest.get("email") or "—", False),
         ("Phone", guest.get("phone") or "— (registered before phone was required)", False),
         ("Tickets", str(tickets), True),
+        ("Seats", seats_value, True),
         ("Wristbands", str(bands), True),
     ]
 

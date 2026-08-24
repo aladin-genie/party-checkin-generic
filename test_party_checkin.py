@@ -9,6 +9,7 @@ import sys
 import html
 import io
 import csv
+import re
 import threading
 import time
 import zipfile
@@ -68,6 +69,8 @@ from utils import (
     get_registration_daily_counts,
     get_event_day_hourly_checkins,
     format_dt,
+    to_event_local,
+    format_event_local_dt,
     get_setting,
     set_setting,
     get_checkin_mode,
@@ -81,6 +84,7 @@ from utils import (
     sponsor_list,
 )
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 # We need to mock Streamlit for testing outside the app
 import unittest
@@ -118,6 +122,19 @@ def _guest_name(index: int) -> str:
         n, rem = divmod(n - 1, 26)
         label = chr(65 + rem) + label
     return f"Guest {label}"
+
+
+def _local_to_utc_naive(dt_naive_local: datetime) -> datetime:
+    """Convert a naive wall-clock datetime in config.EVENT_TIMEZONE to the
+    naive UTC datetime that would actually land in the database.
+
+    Mirrors what a real check-in/registration produces: a guest scans in at
+    some LOCAL wall-clock moment, and _utc_now() stores its UTC equivalent.
+    Tests build fixtures this way (rather than guessing a fixed offset) so
+    they stay correct across the CDT/CST boundary.
+    """
+    aware_local = dt_naive_local.replace(tzinfo=ZoneInfo(config.EVENT_TIMEZONE))
+    return aware_local.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 class TestPartyCheckIn(unittest.TestCase):
@@ -165,10 +182,10 @@ class TestPartyCheckIn(unittest.TestCase):
 
     def _register(self, name="Reg Guest", email="reg@test.com", phone="",
                    ticket_count=1, plus_one_name="", zelle_ref="ZELLE-DEFAULT01",
-                   veg_count=0, non_veg_count=0):
+                   seat_numbers=None):
         """Helper: create a guest via the service layer (returns the result dict)."""
         return register_guest(name, email, phone, ticket_count, plus_one_name, zelle_ref,
-                               veg_count, non_veg_count)
+                               seat_numbers=seat_numbers)
 
     # ── Database Tests ──────────────────────────────────────────────────────
     
@@ -320,25 +337,6 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertAlmostEqual(stats["checkin_percentage"], 66.7, places=1)
         self.assertEqual(stats["revenue"], 300.0)  # $100 + $50 + $150 for the three bookings
         session.close()
-
-    def test_get_stats_reports_meal_totals_across_guests(self):
-        session = get_db()
-        session.add(Guest(
-            name="Meal Guest A", email="mealstatsa@test.com", ticket_count=2,
-            zelle_ref="ZELLE-MEALSTATA", qr_code=generate_qr_code(),
-            veg_count=1, non_veg_count=1,
-        ))
-        session.add(Guest(
-            name="Meal Guest B", email="mealstatsb@test.com", ticket_count=3,
-            zelle_ref="ZELLE-MEALSTATB", qr_code=generate_qr_code(),
-            veg_count=3, non_veg_count=0,
-        ))
-        session.commit()
-        session.close()
-
-        stats = get_stats()
-        self.assertEqual(stats["veg_total"], 4)
-        self.assertEqual(stats["non_veg_total"], 1)
 
     def test_visit_stats(self):
         # Record a few visits from different tokens
@@ -492,25 +490,72 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(row["Additional Guest Names"], "Ann Lee, Bob Ray")
         self.assertEqual(len(rows), 1)
 
-    def test_generate_csv_carries_the_meal_counts(self):
+    def test_generate_csv_checkin_column_is_local_time_with_labeled_header(self):
+        """The bug this guards: checkin_time is stored naive UTC, so the CSV
+        export used to show the organiser 23:05 for a 6:05 PM CDT check-in.
+        The column must show local time, and the header must say which
+        timezone so nobody reconciling the export has to guess."""
         session = get_db()
         session.add(Guest(
-            name="Meal CSV Guest",
-            email="mealcsv@test.com",
-            ticket_count=3,
-            plus_one_name="Ann Lee\nBob Ray",
-            zelle_ref="ZELLE-MEALCSV",
+            name="CSV Local Time",
+            email="csvlocaltime@test.com",
+            ticket_count=1,
+            zelle_ref="ZELLE-CSVLOCAL",
             qr_code=generate_qr_code(),
-            veg_count=2,
-            non_veg_count=1,
+            checked_in=True,
+            checkin_time=datetime(2026, 10, 3, 23, 5, 0),  # 6:05 PM CDT
+        ))
+        session.commit()
+        session.close()
+
+        csv_data = generate_csv()
+        header = next(csv.reader(io.StringIO(csv_data)))
+        self.assertIn(f"Check-in Time ({config.EVENT_TIMEZONE})", header)
+
+        rows = list(csv.DictReader(io.StringIO(csv_data)))
+        row = next(r for r in rows if r["Email"] == "csvlocaltime@test.com")
+        checkin_col = f"Check-in Time ({config.EVENT_TIMEZONE})"
+        self.assertEqual(row[checkin_col], "2026-10-03 18:05:00")
+
+    def test_generate_csv_carries_the_seat_numbers(self):
+        """The organiser's door list needs the actual seat LABELS a guest
+        was told at booking (row letter + seat number), sorted, not the raw
+        stored integers in their original insertion order."""
+        session = get_db()
+        session.add(Guest(
+            name="Seated CSV Guest",
+            email="seatedcsv@test.com",
+            ticket_count=3,
+            zelle_ref="ZELLE-SEATCSV",
+            qr_code=generate_qr_code(),
+            seat_numbers="4,17,3",
         ))
         session.commit()
         session.close()
 
         rows = list(csv.DictReader(io.StringIO(generate_csv())))
-        row = next(r for r in rows if r["Email"] == "mealcsv@test.com")
-        self.assertEqual(row["Veg"], "2")
-        self.assertEqual(row["Non-Veg"], "1")
+        row = next(r for r in rows if r["Email"] == "seatedcsv@test.com")
+        expected = config.format_seat_labels([4, 17, 3])
+        self.assertEqual(row["Seats"], expected)
+        self.assertEqual(expected, "A3, A4, B7")
+
+    def test_generate_csv_seats_column_blank_for_legacy_rows(self):
+        """A row with no seat_numbers predates seat-picking — show "—",
+        never a blank cell that could be misread as a data error."""
+        session = get_db()
+        session.add(Guest(
+            name="Legacy CSV Guest",
+            email="legacycsv@test.com",
+            ticket_count=1,
+            zelle_ref="ZELLE-LEGACYCSV",
+            qr_code=generate_qr_code(),
+        ))
+        session.commit()
+        session.close()
+
+        rows = list(csv.DictReader(io.StringIO(generate_csv())))
+        row = next(r for r in rows if r["Email"] == "legacycsv@test.com")
+        self.assertEqual(row["Seats"], "—")
 
     # ── Email Tests ─────────────────────────────────────────────────────────
     
@@ -608,24 +653,6 @@ class TestPartyCheckIn(unittest.TestCase):
                                  ticket_count=0, zelle_ref="ZELLE-ZEROTIX1")
         self.assertTrue(result["ok"])
         self.assertEqual(result["guest"]["ticket_count"], 1)
-
-    def test_register_guest_persists_meal_counts(self):
-        # register_guest doesn't re-validate (it trusts the caller), so this
-        # only checks the values it's given are saved and read back correctly.
-        result = self._register(
-            name="Meal Counter",
-            email="mealcounter@test.com",
-            phone="+1-555-000-2222",
-            ticket_count=4,
-            plus_one_name="Ann Lee\nBob Ray\nCal Vue",
-            zelle_ref="ZELLE-MEALCNT1",
-            veg_count=3,
-            non_veg_count=1,
-        )
-        self.assertTrue(result["ok"])
-        guest = result["guest"]
-        self.assertEqual(guest["veg_count"], 3)
-        self.assertEqual(guest["non_veg_count"], 1)
 
     def test_register_guest_ticket_count_coercion_numeric_string(self):
         result = self._register(name="Str Tix", email="strtix@test.com",
@@ -915,6 +942,42 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(second["status"], "already")
         self.assertIn("QR Flow", second["message"])
 
+    def test_check_in_by_code_already_message_shows_local_time_not_utc(self):
+        """The bug this guards: checkin_time is stored naive UTC, so a guest
+        who checked in at 6:05 PM CDT (stored as 23:05 UTC) used to be told
+        by the "already checked in" message that they arrived at 23:05 —
+        five hours wrong, at the door, on event night."""
+        reg = self._register(name="Already Guest", email="alreadyguest@test.com",
+                             zelle_ref="ZELLE-ALREADY1")
+        session = get_db()
+        g = session.query(Guest).filter_by(id=reg["guest"]["id"]).first()
+        g.checked_in = True
+        g.checkin_time = datetime(2026, 10, 3, 23, 5, 0)  # 6:05 PM CDT
+        session.commit()
+        session.close()
+
+        result = check_in_by_code(reg["guest"]["qr_code"])
+        self.assertEqual(result["status"], "already")
+        self.assertIn("18:05", result["message"])
+        self.assertNotIn("23:05", result["message"])
+
+    def test_check_in_guest_already_message_shows_local_time_not_utc(self):
+        """Same fix, via the confirm-by-id door flow (check_in_guest)
+        instead of the scan-a-code flow."""
+        reg = self._register(name="Already Confirmed", email="alreadyconfirmed@test.com",
+                             zelle_ref="ZELLE-ALRCONF1")
+        session = get_db()
+        g = session.query(Guest).filter_by(id=reg["guest"]["id"]).first()
+        g.checked_in = True
+        g.checkin_time = datetime(2026, 10, 3, 23, 5, 0)  # 6:05 PM CDT
+        session.commit()
+        session.close()
+
+        result = check_in_guest(reg["guest"]["id"])
+        self.assertEqual(result["status"], "already")
+        self.assertIn("18:05", result["message"])
+        self.assertNotIn("23:05", result["message"])
+
     def test_check_in_by_code_by_email(self):
         self._register(name="Email Flow", email="emailflow@test.com", zelle_ref="ZELLE-EMLFLOW1")
         result = check_in_by_code("emailflow@test.com")
@@ -1057,15 +1120,39 @@ class TestPartyCheckIn(unittest.TestCase):
         # Oldest first
         self.assertEqual(counts[0][0], day1.date())
 
+    def test_get_registration_daily_counts_evening_local_registration_not_pushed_to_next_day(self):
+        """The bug this guards: created_at is stored naive UTC, so a 9 PM
+        CDT registration is 2 AM UTC the FOLLOWING day. Bucketing by the raw
+        UTC date used to attribute it to the wrong (later) calendar day."""
+        reg = self._register(name="Evening Registrant", email="eveningreg@test.com",
+                             zelle_ref="ZELLE-EVEREG01")
+        created_utc = _local_to_utc_naive(config.EVENT_DATE.replace(hour=21, minute=0))
+        # Confirm the fixture really does cross into the next UTC day.
+        self.assertEqual(created_utc.date(), (config.EVENT_DATE + timedelta(days=1)).date())
+
+        session = get_db()
+        g = session.query(Guest).filter_by(id=reg["guest"]["id"]).first()
+        g.created_at = created_utc
+        session.commit()
+        session.close()
+
+        counts_dict = dict(get_registration_daily_counts())
+        self.assertEqual(counts_dict.get(config.EVENT_DATE.date()), reg["guest"]["ticket_count"])
+        self.assertNotIn((config.EVENT_DATE + timedelta(days=1)).date(), counts_dict)
+
     def test_get_event_day_hourly_checkins_24_entries_and_bucketing(self):
         r1 = self._register(name="Hourly1", email="hourly1@test.com", zelle_ref="ZELLE-HOURLY001")
         r2 = self._register(name="Hourly2", email="hourly2@test.com", zelle_ref="ZELLE-HOURLY002")
         r3 = self._register(name="OffDay", email="offday@test.com", zelle_ref="ZELLE-OFFDAY001")
 
-        event_hour_a = config.EVENT_DATE.replace(hour=9, minute=15)
-        event_hour_b = config.EVENT_DATE.replace(hour=9, minute=45)
-        other_day = config.EVENT_DATE - timedelta(days=1)
-        other_day = other_day.replace(hour=9, minute=0)
+        # checkin_time is stored naive UTC (_utc_now()), so these fixtures
+        # are built as the UTC equivalent of a 9 AM LOCAL check-in on (and
+        # the day before) the event — exactly what a real scan would write.
+        event_hour_a = _local_to_utc_naive(config.EVENT_DATE.replace(hour=9, minute=15))
+        event_hour_b = _local_to_utc_naive(config.EVENT_DATE.replace(hour=9, minute=45))
+        other_day = _local_to_utc_naive(
+            (config.EVENT_DATE - timedelta(days=1)).replace(hour=9, minute=0)
+        )
 
         session = get_db()
         for gid, dt in [
@@ -1081,8 +1168,49 @@ class TestPartyCheckIn(unittest.TestCase):
 
         hourly = get_event_day_hourly_checkins()
         self.assertEqual(len(hourly), 24)
+        # Bucketed by LOCAL hour (9 AM local), not the raw UTC hour.
         self.assertEqual(hourly[9], 2)
         self.assertEqual(sum(hourly), 2)  # the off-day checkin must not be counted
+
+    def test_get_event_day_hourly_checkins_evening_local_time_not_utc(self):
+        """The bug this guards: checkin_time is stored naive UTC, so a 6:05
+        PM CDT check-in used to be misbucketed into hour 23 (the raw UTC
+        hour) instead of 18 (its local hour)."""
+        reg = self._register(name="Evening Guest", email="eveningguest@test.com",
+                             zelle_ref="ZELLE-EVENING01")
+        session = get_db()
+        g = session.query(Guest).filter_by(id=reg["guest"]["id"]).first()
+        g.checked_in = True
+        g.checkin_time = _local_to_utc_naive(config.EVENT_DATE.replace(hour=18, minute=5))
+        session.commit()
+        session.close()
+
+        hourly = get_event_day_hourly_checkins()
+        self.assertEqual(hourly[18], 1)
+        self.assertEqual(hourly[23], 0)
+
+    def test_get_event_day_hourly_checkins_late_evening_checkin_is_not_dropped(self):
+        """The worse half of the same bug: a 7:30 PM CDT check-in is 00:30
+        UTC the FOLLOWING day, which used to fall outside the (UTC)
+        midnight-to-midnight filter window and vanish from the chart
+        entirely. It must still be counted, in its correct local hour."""
+        reg = self._register(name="Late Guest", email="lateguest@test.com",
+                             zelle_ref="ZELLE-LATEEVE1")
+        checkin_utc = _local_to_utc_naive(config.EVENT_DATE.replace(hour=19, minute=30))
+        # Confirm the fixture really does cross into the next UTC day —
+        # otherwise this test wouldn't be exercising the regression at all.
+        self.assertEqual(checkin_utc.date(), (config.EVENT_DATE + timedelta(days=1)).date())
+
+        session = get_db()
+        g = session.query(Guest).filter_by(id=reg["guest"]["id"]).first()
+        g.checked_in = True
+        g.checkin_time = checkin_utc
+        session.commit()
+        session.close()
+
+        hourly = get_event_day_hourly_checkins()
+        self.assertEqual(hourly[19], 1)
+        self.assertEqual(sum(hourly), 1)
 
     # ── Service Layer: validate_registration ────────────────────────────────
 
@@ -1096,8 +1224,6 @@ class TestPartyCheckIn(unittest.TestCase):
             zelle_ref="ZELLE12345678",
             agree_terms=True,
             ticket_count=2,
-            veg_count=1,
-            non_veg_count=1,
         )
         self.assertEqual(errors, {})
         self.assertEqual(cleaned["name"], "Jane Doe")
@@ -1108,8 +1234,37 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(cleaned["additional_guest_count"], 1)
         self.assertEqual(cleaned["zelle_ref"], "ZELLE12345678")
         self.assertTrue(cleaned["terms"])
-        self.assertEqual(cleaned["veg_count"], 1)
-        self.assertEqual(cleaned["non_veg_count"], 1)
+
+    def test_validate_registration_no_longer_collects_meal_counts(self):
+        """Meal Preferences was retired — food at the venue is now
+        vegetarian-only and simply available for purchase, so nothing in the
+        registration path should still validate, clean, or reject meal
+        counts. Locks this in so the feature can't silently come back."""
+        # A submit that would have failed the old food_count check (more
+        # "meals" than tickets) must still succeed today — there's no such
+        # concept left to fail on.
+        cleaned, errors = validate_registration(
+            name="Jane Doe",
+            email="nomealsvalid@example.com",
+            phone="555-123-4567",
+            plus_one_name="John Doe",
+            zelle_ref="ZELLE12345678",
+            agree_terms=True,
+            ticket_count=2,
+        )
+        self.assertNotIn("food_count", errors)
+        self.assertNotIn("veg_count", cleaned)
+        self.assertNotIn("non_veg_count", cleaned)
+
+        # Also true on an otherwise-invalid submission — "food_count" must
+        # never appear in errors for any input.
+        cleaned_bad, errors_bad = validate_registration(
+            name="", email="not-an-email", phone="", plus_one_name="",
+            zelle_ref="", agree_terms=False, ticket_count=999,
+        )
+        self.assertNotIn("food_count", errors_bad)
+        self.assertNotIn("veg_count", cleaned_bad)
+        self.assertNotIn("non_veg_count", cleaned_bad)
 
     def test_validate_registration_invalid_name(self):
         cleaned, errors = validate_registration(
@@ -1194,6 +1349,34 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(format_dt(None), "—")
         self.assertEqual(format_dt(None, fallback="N/A"), "N/A")
 
+    # ── to_event_local / format_event_local_dt ──────────────────────────────
+
+    def test_to_event_local_converts_utc_to_cdt_wall_clock(self):
+        # October is Central Daylight Time (UTC-5): a guest checking in at
+        # 6:05 PM CDT is stored as 2026-10-03 23:05:00 naive UTC.
+        stored_utc = datetime(2026, 10, 3, 23, 5, 0)
+        local = to_event_local(stored_utc)
+        self.assertEqual(local, datetime(2026, 10, 3, 18, 5, 0))
+
+    def test_to_event_local_converts_utc_to_cst_wall_clock(self):
+        # January is Central Standard Time (UTC-6) — the offset changes
+        # across the DST boundary, which is exactly why this converts via
+        # zoneinfo rather than a fixed offset.
+        stored_utc = datetime(2026, 1, 15, 6, 0, 0)
+        local = to_event_local(stored_utc)
+        self.assertEqual(local, datetime(2026, 1, 15, 0, 0, 0))
+
+    def test_to_event_local_handles_none(self):
+        self.assertIsNone(to_event_local(None))
+
+    def test_format_event_local_dt_formats_in_local_time(self):
+        stored_utc = datetime(2026, 10, 3, 23, 5, 0)
+        self.assertEqual(format_event_local_dt(stored_utc, "%H:%M"), "18:05")
+
+    def test_format_event_local_dt_fallback_for_none(self):
+        self.assertEqual(format_event_local_dt(None), "—")
+        self.assertEqual(format_event_local_dt(None, fallback="N/A"), "N/A")
+
     # ── Security: admin password fail-closed ────────────────────────────────
 
     def test_verify_admin_password_fails_closed_when_unconfigured(self):
@@ -1239,7 +1422,10 @@ class TestPartyCheckIn(unittest.TestCase):
         rows = list(reader)
         header = rows[0]
         name_idx = header.index("Name")
-        checkin_idx = header.index("Check-in Time")
+        # The column header names the timezone explicitly (see
+        # generate_csv()) so an organiser reconciling the export is never
+        # guessing whether a time is local or UTC.
+        checkin_idx = header.index(f"Check-in Time ({config.EVENT_TIMEZONE})")
         row = next(r for r in rows[1:] if "HYPERLINK" in r[name_idx])
         self.assertTrue(row[name_idx].startswith("'"))
         self.assertEqual(row[checkin_idx], "")
@@ -1324,6 +1510,47 @@ class TestPartyCheckIn(unittest.TestCase):
         sent_msg = mock_server.send_message.call_args[0][0]
         html_part = next(p for p in sent_msg.walk() if p.get_content_type() == "text/html")
         self.assertNotIn("Additional guests", html_part.get_payload(decode=True).decode("utf-8"))
+
+    def test_qr_email_includes_the_seat_numbers(self):
+        """A guest arriving at the door needs their seat labels in hand —
+        both the HTML and plain-text bodies must carry them, in the
+        venue-style form (config.format_seat_labels()), not raw integers."""
+        guest = Guest(
+            id=99996, name="Seated Guest", email="seated@test.com", ticket_count=3,
+            plus_one_name="", qr_code="SEATED-QR-CODE", seat_numbers="17,3,4",
+        )
+        with patch.dict(mock_secrets, {"MAIL_USERNAME": "sender@test.com", "MAIL_PASSWORD": "testpass"}):
+            with patch("smtplib.SMTP") as mock_smtp_cls:
+                mock_server = MagicMock()
+                mock_smtp_cls.return_value.__enter__.return_value = mock_server
+                self.assertTrue(send_qr_email(guest))
+
+        sent_msg = mock_server.send_message.call_args[0][0]
+        parts = {p.get_content_type(): p.get_payload(decode=True).decode("utf-8")
+                 for p in sent_msg.walk() if p.get_content_type().startswith("text/")}
+
+        # Sorted/de-duplicated (config.format_seat_labels), regardless of storage order.
+        expected = f"Seats: {config.format_seat_labels([17, 3, 4])}"
+        self.assertEqual(expected, "Seats: A3, A4, B7")
+        self.assertIn(expected, parts["text/html"])
+        self.assertIn(expected, parts["text/plain"])
+
+    def test_qr_email_omits_the_seat_line_for_a_legacy_booking(self):
+        """A row with no seat_numbers predates seat-picking — the email must
+        not claim seats that were never assigned."""
+        guest = Guest(
+            id=99995, name="No Seats", email="noseats@test.com", ticket_count=1,
+            plus_one_name="", qr_code="NOSEATS-QR-CODE",
+        )
+        with patch.dict(mock_secrets, {"MAIL_USERNAME": "sender@test.com", "MAIL_PASSWORD": "testpass"}):
+            with patch("smtplib.SMTP") as mock_smtp_cls:
+                mock_server = MagicMock()
+                mock_smtp_cls.return_value.__enter__.return_value = mock_server
+                self.assertTrue(send_qr_email(guest))
+
+        sent_msg = mock_server.send_message.call_args[0][0]
+        html_part = next(p for p in sent_msg.walk() if p.get_content_type() == "text/html")
+        self.assertNotIn("Seats:", html_part.get_payload(decode=True).decode("utf-8"))
 
     # ── Pure helpers: _normalize_postgres_url ───────────────────────────────
 
@@ -1614,18 +1841,16 @@ class TestPartyCheckIn(unittest.TestCase):
     # ── Guest names must match the ticket count ─────────────────────────────
     # One ticket per person: N tickets is the booker plus N-1 named guests.
 
-    def _names_check(self, ticket_count, plus_one_name, email, veg_count=0, non_veg_count=0):
+    def _names_check(self, ticket_count, plus_one_name, email):
         """validate_registration with everything but the names/tickets valid."""
         return validate_registration(
             "Jane Doe", email, "555-123-4567", plus_one_name, "ZELLE12345678", True,
             ticket_count=ticket_count,
-            veg_count=veg_count, non_veg_count=non_veg_count,
         )
 
     def test_validate_registration_exact_name_count_accepted(self):
         cleaned, errors = self._names_check(
             4, "Ann Lee\nBob Ray\nCal Vue", "exactnames@example.com",
-            veg_count=2, non_veg_count=2,
         )
         self.assertEqual(errors, {})
         self.assertEqual(cleaned["additional_guest_count"], 3)
@@ -1688,52 +1913,10 @@ class TestPartyCheckIn(unittest.TestCase):
     def test_validate_registration_comma_separated_names_count_correctly(self):
         cleaned, errors = self._names_check(
             3, "Ann Lee, Bob Ray", "commanames@example.com",
-            veg_count=2, non_veg_count=1,
         )
         self.assertEqual(errors, {})
         self.assertEqual(cleaned["plus_one_name"], "Ann Lee\nBob Ray")
         self.assertEqual(cleaned["additional_guest_count"], 2)
-
-    # ── Meal counts are optional planning preferences ───────────────────────
-    # Food is available for purchase at the venue, so veg + non-veg may be 0
-    # up to ticket_count. Only more meals than tickets is rejected.
-
-    def _food_check(self, ticket_count, veg_count, non_veg_count, email):
-        """validate_registration with everything but the food count valid."""
-        expected_names = utils.additional_guests_expected(ticket_count)
-        names = "\n".join(_guest_name(i) for i in range(expected_names))
-        return validate_registration(
-            "Jane Doe", email, "555-123-4567", names, "ZELLE12345678", True,
-            ticket_count=ticket_count, veg_count=veg_count, non_veg_count=non_veg_count,
-        )
-
-    def test_validate_registration_exact_food_count_accepted(self):
-        cleaned, errors = self._food_check(4, 2, 2, "exactfood@example.com")
-        self.assertNotIn("food_count", errors)
-        self.assertEqual(cleaned["veg_count"], 2)
-        self.assertEqual(cleaned["non_veg_count"], 2)
-
-    def test_validate_registration_zero_meals_accepted(self):
-        cleaned, errors = self._food_check(4, 0, 0, "nomeals@example.com")
-        self.assertNotIn("food_count", errors)
-        self.assertEqual(cleaned["veg_count"], 0)
-        self.assertEqual(cleaned["non_veg_count"], 0)
-
-    def test_validate_registration_fewer_meals_than_tickets_accepted(self):
-        cleaned, errors = self._food_check(4, 1, 1, "fewermeals@example.com")
-        self.assertNotIn("food_count", errors)
-
-    def test_validate_registration_too_many_meals_rejected(self):
-        cleaned, errors = self._food_check(2, 2, 2, "toomanymeals@example.com")
-        self.assertIn("food_count", errors)
-
-    def test_validate_registration_negative_veg_count_rejected(self):
-        cleaned, errors = self._food_check(2, -1, 3, "negveg@example.com")
-        self.assertIn("food_count", errors)
-
-    def test_validate_registration_negative_non_veg_count_rejected(self):
-        cleaned, errors = self._food_check(2, 3, -1, "negnonveg@example.com")
-        self.assertIn("food_count", errors)
 
     # ── Head-count helpers ──────────────────────────────────────────────────
 
@@ -2384,6 +2567,76 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertNotIn("hero-theme", html_out)
         self.assertNotIn("hero-subtitle-local", html_out)
 
+    def test_hero_event_name_outranks_the_org_tagline(self):
+        """The actual event (config.EVENT_SUBTITLE) has to visually lead the
+        org's mission tagline (config.EVENT_TAGLINE), not blend into it —
+        they used to share one `.hero-subtitle` class, with the tagline
+        printed FIRST, so a guest arriving to check "is this the right
+        event" saw the org's mission statement before the event name. Each
+        now gets its own class, and the event name must render before the
+        (now demoted) tagline in the markup."""
+        html_out = theme.hero()
+        self.assertIn('class="hero-event-name"', html_out)
+        self.assertIn('class="hero-tagline"', html_out)
+        self.assertIn(html.escape(config.EVENT_SUBTITLE), html_out)
+        self.assertIn(html.escape(config.EVENT_TAGLINE), html_out)
+        # Order: org name -> event name -> Kannada tagline -> org tagline.
+        self.assertLess(
+            html_out.index('class="hero-title"'), html_out.index('class="hero-event-name"')
+        )
+        self.assertLess(
+            html_out.index('class="hero-event-name"'), html_out.index('class="hero-subtitle-local"')
+        )
+        self.assertLess(
+            html_out.index('class="hero-subtitle-local"'), html_out.index('class="hero-tagline"')
+        )
+        # The old shared class must be gone entirely, not just renamed for
+        # one of the two lines.
+        self.assertNotIn('class="hero-subtitle"', html_out)
+
+    @staticmethod
+    def _rule_font_size_rem(css: str, class_name: str) -> float:
+        """First font-size (in rem) declared for `.class_name` in `css`,
+        e.g. class_name="hero-title" against ".hero-title { font-size:
+        2.1rem; ... }" -> 2.1. Used to check relative visual prominence
+        between two rules without hardcoding exact values that would make
+        the test brittle to a future tweak."""
+        block_match = re.search(r"\." + re.escape(class_name) + r"\s*{([^}]*)}", css)
+        assert block_match, f"no CSS rule found for .{class_name}"
+        size_match = re.search(r"font-size:\s*([\d.]+)rem", block_match.group(1))
+        assert size_match, f"no font-size found in .{class_name}'s rule"
+        return float(size_match.group(1))
+
+    def test_hero_event_name_is_the_visual_headline_not_the_org_name(self):
+        """theme.hero() previously rendered the org name (`.hero-title`,
+        2.1rem) larger than the actual performance name (`.hero-event-name`,
+        1.3rem) — so despite the docstring's claim that the event name
+        "outranks" everything below it, a guest's eye still landed on the
+        org name first. The performance is what a guest is actually being
+        invited to, so it must now be the largest, boldest text on the
+        banner — checked at both the default and the <=640px breakpoint."""
+        default_title = self._rule_font_size_rem(theme._CSS, "hero-title")
+        default_event_name = self._rule_font_size_rem(theme._CSS, "hero-event-name")
+        self.assertGreater(default_event_name, default_title)
+
+        mobile_block = re.search(r"@media \(max-width: 640px\)\s*{(.*?)}\s*}", theme._CSS, re.DOTALL)
+        self.assertIsNotNone(mobile_block, "no <=640px hero breakpoint found")
+        mobile_title = self._rule_font_size_rem(mobile_block.group(1), "hero-title")
+        mobile_event_name = self._rule_font_size_rem(mobile_block.group(1), "hero-event-name")
+        self.assertGreater(mobile_event_name, mobile_title)
+
+    def test_hero_theme_badge_separates_pill_from_note(self):
+        """The dress-theme pill and its detail note used to be crammed into
+        one flex row (`<span>Theme</span> <small>note</small>` inside a
+        single `.hero-theme`), which shrink-wrapped into a cramped, lopsided
+        two-line pill at phone widths. They must now be two separate block
+        elements stacked in a column wrapper so each wraps on its own."""
+        html_out = theme.hero()
+        self.assertIn('class="hero-theme-wrap"', html_out)
+        self.assertIn('class="hero-theme-note"', html_out)
+        self.assertIn(html.escape(config.EVENT_THEME_NOTE), html_out)
+        self.assertNotIn("<small>", html_out)
+
     def test_event_strip_states_date_venue_and_dress_theme(self):
         """Register is the landing page, so this strip is the only place
         many guests will see the venue or the dress theme at all."""
@@ -2391,6 +2644,23 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertIn(html.escape(config.EVENT_DATE_SHORT), html_out)
         self.assertIn(html.escape(config.VENUE_NAME), html_out)
         self.assertIn(config.EVENT_THEME, html_out)
+
+    def test_event_strip_gives_the_performance_title_its_own_class_and_no_duplicate_emoji(self):
+        """The performance name (config.EVENT_SUBTITLE) used to reuse
+        `.event-strip-date`'s class and lead with a 🎭 that duplicated the
+        dress-theme chip's own 🎭 a few items over, reading as just another
+        metadata chip instead of the event's title."""
+        html_out = theme.event_strip()
+        self.assertIn('class="event-strip-title"', html_out)
+        self.assertIn(html.escape(config.EVENT_SUBTITLE), html_out)
+
+        title_start = html_out.index('class="event-strip-title"')
+        title_end = html_out.index('</div>', title_start)
+        title_block = html_out[title_start:title_end]
+        self.assertNotIn("event-strip-date", title_block)
+        self.assertNotIn("🎭", title_block)
+        # It's a heading above the chip strip, not a chip inside it.
+        self.assertLess(title_start, html_out.index('class="event-strip"'))
 
     def test_flyer_card_renders_nothing_without_an_image(self):
         """config.EVENT_FLYER names a path that may not exist yet, so every
@@ -2403,6 +2673,24 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertIn("flyer-card", html_out)
         self.assertIn("&amp;b=2", html_out)
         self.assertNotIn('alt="Ev"il"', html_out)
+
+    def test_flyer_card_renders_and_escapes_an_optional_caption(self):
+        """Home passes a caption tying the poster to the event; Register's
+        collapsed-expander flyer omits it. Must be escaped like every other
+        guest/config-derived string, and omitted entirely (no empty
+        <div>) when not given."""
+        html_out = theme.flyer_card("https://example.com/f.png", caption='<b>Evil</b> & Co')
+        self.assertIn("flyer-caption", html_out)
+        self.assertIn("&lt;b&gt;Evil&lt;/b&gt; &amp; Co", html_out)
+        self.assertNotIn("<b>Evil</b>", html_out)
+
+        no_caption = theme.flyer_card("https://example.com/f.png")
+        self.assertNotIn("flyer-caption", no_caption)
+
+    def test_flyer_card_still_renders_nothing_without_an_image_even_with_a_caption(self):
+        """caption must never resurrect the card for a blank src — Home
+        builds the caption unconditionally and relies on this."""
+        self.assertEqual(theme.flyer_card("", caption="Some Event · Some Date"), "")
 
     def test_event_flyer_is_optional_and_resolves_when_set(self):
         """The flyer was removed for this event because the same details are
@@ -2603,17 +2891,20 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(theme.tier_range_label({"min": 22, "max": None}), "22+")
         self.assertEqual(theme.tier_range_label({"min": 5, "max": 5}), "5")
 
-    def test_total_card_shows_the_discounted_price_and_savings(self):
-        html_out = theme.total_card(26, 127500, savings=25.0)
+    def test_total_card_shows_the_exact_total(self):
+        html_out = theme.total_card(26, 127500)
         self.assertIn("$1,275.00", html_out)
         self.assertIn("26 seats selected", html_out)
-        self.assertIn("you save $25.00", html_out)
 
-    def test_total_card_hides_the_savings_line_when_there_is_no_discount(self):
-        html_out = theme.total_card(1, 5000, savings=0.0)
+    def test_total_card_never_claims_a_discount(self):
+        """Seats are picked individually now (config.seats_total_cents), so
+        there is no "vs base price" comparison that means anything for an
+        arbitrary pick — total_card() must never claim one."""
+        html_out = theme.total_card(1, 5000)
         self.assertIn("$50.00", html_out)
         self.assertIn("1 seat selected", html_out)
         self.assertNotIn("you save", html_out)
+        self.assertNotIn("savings", html_out)
 
     def test_next_tier_nudge_states_the_new_price_and_renders_nothing_at_the_top(self):
         tier = config.next_price_tier(1)
@@ -2623,6 +2914,197 @@ class TestPartyCheckIn(unittest.TestCase):
 
         self.assertEqual(theme.next_tier_nudge(76, None, 1000), "")
         self.assertEqual(theme.next_tier_nudge(76, config.next_price_tier(76), 1000), "")
+
+    # ── Seat picking: seat_map / seat_breakdown ─────────────────────────────
+    # Seats are real, individually-numbered inventory now (see
+    # config.SEAT_TIERS): a guest picks specific seats rather than a plain
+    # quantity, and every cell on the map must render in exactly one of
+    # three states — taken, selected, or available.
+
+    def _seat_cells(self, html_out):
+        """Split rendered seat-map HTML back into one string per seat cell,
+        mirroring _tier_rows() above."""
+        return [f'<div class="seat {part}' for part in html_out.split('<div class="seat ')[1:]]
+
+    def _seat_cell_for(self, html_out, seat):
+        # Cells render the venue-style label (config.seat_label(), e.g.
+        # "B7"), not the bare stored integer.
+        label = config.seat_label(seat)
+        for cell in self._seat_cells(html_out):
+            if f'<span>{label}</span>' in cell:
+                return cell
+        return None
+
+    def test_seat_map_renders_taken_selected_and_available_as_distinct_states(self):
+        html_out = theme.seat_map(selected=[2], taken=[1, 3], max_seats=10)
+
+        taken_cell = self._seat_cell_for(html_out, 1)
+        self.assertIn("seat-taken", taken_cell)
+        self.assertIn("already booked", taken_cell)
+        self.assertNotIn("selected", taken_cell)
+
+        selected_cell = self._seat_cell_for(html_out, 2)
+        self.assertIn("selected", selected_cell)
+        self.assertNotIn("seat-taken", selected_cell)
+
+        available_cell = self._seat_cell_for(html_out, 4)
+        self.assertNotIn("seat-taken", available_cell)
+        self.assertNotIn("selected", available_cell)
+
+        # Both legends are present: the tier swatches and a "Taken" swatch.
+        self.assertIn(">Taken</span>", html_out)
+        self.assertIn("seat-legend-item", html_out)
+
+    def test_seat_map_a_taken_seat_is_never_also_selectable(self):
+        """If a stale selection the caller hasn't pruned yet overlaps with a
+        seat that's actually taken, real inventory wins — the seat renders
+        taken, never as the guest's own selection."""
+        html_out = theme.seat_map(selected=[5], taken=[5], max_seats=10)
+        cell = self._seat_cell_for(html_out, 5)
+        self.assertIn("seat-taken", cell)
+        self.assertNotIn("selected", cell)
+
+    def test_seat_map_states_seats_chosen_and_seats_still_available(self):
+        html_out = theme.seat_map(selected=[1, 2], taken=[3], max_seats=10)
+        self.assertIn("2 seats selected", html_out)
+        # 10 total - 1 taken - 2 selected = 7 still up for grabs.
+        self.assertIn("7 still available", html_out)
+
+    def test_seat_map_cells_show_venue_style_labels_not_bare_integers(self):
+        """Real auditorium seats are row-lettered — a guest expects "B7" at
+        the door, not a bare integer."""
+        html_out = theme.seat_map(selected=[], taken=[], max_seats=25)
+        self.assertIn("<span>A1</span>", html_out)
+        self.assertIn("<span>B1</span>", html_out)
+        self.assertIn('aria-label="Seat B1', html_out)
+        # No leftover bare-integer cell text for a two-digit seat number.
+        self.assertNotIn("<span>11</span>", html_out)
+
+    def test_seat_map_renders_a_row_letter_gutter_per_row(self):
+        """The seat map should read like a real seating chart: each row
+        starts with its own row-letter gutter, not just labelled cells."""
+        html_out = theme.seat_map(selected=[], taken=[], max_seats=25)
+        self.assertIn('class="seat-row-label">A<', html_out)
+        self.assertIn('class="seat-row-label">B<', html_out)
+        self.assertIn('class="seat-row-label">C<', html_out)
+        # 25 seats at 10/row is 3 rows (A, B, C) — no row D.
+        self.assertNotIn('class="seat-row-label">D<', html_out)
+
+    def test_seat_breakdown_groups_a_non_contiguous_pick_by_tier(self):
+        html_out = theme.seat_breakdown([1, 2, 90])
+        self.assertIn(f"2 seats in {config.seat_label(1)}–{config.seat_label(25)}", html_out)
+        self.assertIn("$100.00", html_out)
+        self.assertIn(f"1 seat in {config.seat_label(76)}–{config.seat_label(100)}", html_out)
+        self.assertIn("$10.00", html_out)
+        # No line for the untouched middle tier.
+        self.assertNotIn(f"{config.seat_label(26)}–{config.seat_label(75)}", html_out)
+
+    def test_seat_breakdown_empty_selection_renders_nothing(self):
+        self.assertEqual(theme.seat_breakdown([]), "")
+
+    def test_registration_confirmation_includes_the_seat_numbers(self):
+        """This is the guest's receipt — it must say which seats they hold,
+        in the venue-style labels they picked (config.seat_label()), not the
+        raw stored integers."""
+        html_out = theme.registration_confirmation(
+            "Ada Lovelace", "ada@example.com", 3, ["Alan Turing", "Grace Hopper"],
+            seat_numbers=[5, 1, 3],
+        )
+        self.assertIn(">Seats<", html_out)
+        expected = config.format_seat_labels([5, 1, 3])
+        self.assertIn(expected, html_out)
+        self.assertEqual(expected, "A1, A3, A5")
+
+    def test_guest_identity_card_shows_seat_labels_not_bare_integers(self):
+        """Door staff read this row aloud to confirm a guest, so it must say
+        the venue-style label (config.seat_label()) a guest actually knows,
+        not the raw stored integer."""
+        guest = {
+            "name": "Ada Lovelace", "email": "ada@example.com",
+            "phone": "+1-555-000-1111", "ticket_count": 3,
+            "seats": [17, 3, 4], "plus_one_name": "",
+        }
+        html_out = theme.guest_identity_card(guest, bands=3, status_label="Not checked in yet")
+        expected = config.format_seat_labels([17, 3, 4])
+        self.assertIn(expected, html_out)
+        self.assertEqual(expected, "A3, A4, B7")
+        self.assertNotIn(">3, 4, 17<", html_out)
+
+    def test_guest_identity_card_seats_fallback_for_a_legacy_booking(self):
+        guest = {
+            "name": "Legacy Guest", "email": "legacy@example.com",
+            "ticket_count": 1, "seats": [], "plus_one_name": "",
+        }
+        html_out = theme.guest_identity_card(guest, bands=1, status_label="Not checked in yet")
+        self.assertIn("no seats on file", html_out)
+
+    def test_registration_confirmation_omits_seats_row_without_seat_numbers(self):
+        html_out = theme.registration_confirmation("Solo Guest", "solo@example.com", 1, [])
+        self.assertNotIn(">Seats<", html_out)
+
+    # ── Seat pricing table: wording + real total (money-bug fix) ───────────
+    # price_tier_table() used to read like a per-booking group-discount rate
+    # ("26-75 tickets $25.00 each"), which sat directly above the Zelle
+    # address and could be misread as 26 x $25 = $650 instead of the real
+    # $1,275 total shown further down the page. These tests lock in the
+    # corrected wording and the optional total footer that makes the card
+    # self-sufficient.
+
+    def test_price_tier_table_with_total_shows_the_true_booking_total(self):
+        """A guest reading this table before Zelle-ing must see the REAL
+        amount to send (sum of seats 1..N via config.booking_total_cents),
+        never a figure that looks like tickets x tier price."""
+        html_out = theme.price_tier_table(
+            config.price_tiers(), ticket_count=26, total_cents=config.booking_total_cents(26),
+        )
+        self.assertIn("$1,275.00", html_out)
+        self.assertIn("to send", html_out)
+        # The wrong total a guest might compute by multiplying the active
+        # tier's per-seat price (26 x $25 = $650) must never appear.
+        self.assertNotIn("$650.00", html_out)
+
+    def test_price_tier_table_says_seats_and_per_seat_not_tickets_and_each(self):
+        html_out = theme.price_tier_table(config.price_tiers(), ticket_count=26)
+        self.assertIn("Seats", html_out)
+        self.assertIn("per seat", html_out)
+        self.assertNotIn("tickets", html_out)
+        self.assertNotIn("ticket ", html_out)
+        self.assertNotIn(">each<", html_out)
+
+    def test_price_tier_table_omits_total_footer_when_total_cents_is_none(self):
+        html_out = theme.price_tier_table(config.price_tiers(), ticket_count=26)
+        self.assertNotIn("tier-total", html_out)
+        self.assertNotIn("to send", html_out)
+
+    def test_payment_card_passes_the_total_through_to_the_tier_table(self):
+        html_out = theme.payment_card(
+            "zelle@example.com", config.price_tiers(), 26,
+            total_cents=config.booking_total_cents(26),
+        )
+        self.assertIn("$1,275.00", html_out)
+        self.assertIn("to send", html_out)
+
+    def test_payment_card_omits_the_total_footer_without_total_cents(self):
+        """Existing two-arg callers (and any that pass ticket_count alone)
+        must render exactly as before — no footer, no crash."""
+        html_out = theme.payment_card("zelle@example.com", config.price_tiers())
+        self.assertNotIn("to send", html_out)
+
+    def test_payment_card_no_longer_buries_the_kids_and_food_policy(self):
+        """Those two facts moved to their own chips next to the seat picker
+        (theme.seat_policy_chips()) — payment_card()'s paragraph should stay
+        focused on the Zelle mechanics rather than repeat them."""
+        html_out = theme.payment_card("zelle@example.com", config.price_tiers())
+        self.assertNotIn("Kids under age 12", html_out)
+        self.assertNotIn("Food will be available", html_out)
+
+    def test_seat_policy_chips_render_both_facts_from_config(self):
+        """Kids-free and food-at-venue must come from config.py, not be
+        hand-typed here, and both must be escaped like any other copy."""
+        html_out = theme.seat_policy_chips()
+        self.assertIn("policy-chip", html_out)
+        self.assertIn(html.escape(config.KIDS_POLICY_TEXT), html_out)
+        self.assertIn(html.escape(config.FOOD_POLICY_TEXT), html_out)
 
     def test_expected_revenue_prices_each_booking_at_its_own_tier(self):
         """A flat tickets × base_price would over-report the take on every
@@ -2637,6 +3119,258 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(stats["total_tickets"], 27)
         # 1 × $50 + seats 1..26 = $50 + $1,275 = $1,325.00, NOT 27 × $50 = $1,350.00
         self.assertEqual(stats["revenue"], 1325.0)
+
+    # ── Terms & Conditions: a GENERIC participation waiver ─────────────────
+    # The app was cloned from a party template whose T&C told every registrant
+    # that alcohol at the event is BYOB. The real event is a devotional
+    # Yakshagana performance at a spiritual centre. The waiver must name no
+    # specific substance or activity at all — house rules belong to the venue,
+    # not to this form — so "alcohol" should not appear here in any form.
+
+    def test_terms_and_conditions_html_is_generic_and_mentions_no_alcohol(self):
+        lowered = theme.terms_and_conditions_html().lower()
+        for banned in ("byob", "alcohol", "beverage", "intoxicat", "drinking"):
+            self.assertNotIn(
+                banned, lowered,
+                f"the waiver must stay generic — found {banned!r} in it",
+            )
+
+    def test_terms_and_conditions_html_covers_the_required_waiver_points(self):
+        html_out = theme.terms_and_conditions_html()
+        self.assertIn("assume all risks", html_out)
+        self.assertIn("indemnify", html_out)
+        self.assertIn("minors", html_out)
+        self.assertIn("medical treatment", html_out)
+        self.assertIn("photographed or filmed", html_out)
+        self.assertIn("cleared by the posted time", html_out)
+        self.assertIn("I/We Agree", html_out)
+        self.assertIn(html.escape(config.EVENT_NAME), html_out)
+        self.assertIn(html.escape(config.VENUE_NAME), html_out)
+
+    # ── config.seat_pricing_summary() (AGENTS.md: no hardcoded prices in UI) ─
+
+    def test_seat_pricing_summary_reflects_seat_tiers(self):
+        """The Register page's slider help text is built from this sentence
+        specifically so it can never drift from SEAT_TIERS — assert it
+        actually tracks a patched SEAT_TIERS rather than being hardcoded."""
+        with patch.object(config, "SEAT_TIERS", ((1, 25, 5000), (26, 75, 2500), (76, 100, 1000))):
+            baseline = config.seat_pricing_summary()
+        self.assertIn("1–25", baseline)
+        self.assertIn("$50", baseline)
+        self.assertIn("26–75", baseline)
+        self.assertIn("$25", baseline)
+        self.assertIn("76–100", baseline)
+        self.assertIn("$10", baseline)
+
+        with patch.object(config, "SEAT_TIERS", ((1, 10, 2000),)):
+            changed = config.seat_pricing_summary()
+        self.assertNotEqual(baseline, changed)
+        self.assertIn("1–10", changed)
+        self.assertIn("$20", changed)
+
+    # ── venue_info_card(): config-driven venue copy ─────────────────────────
+
+    def test_venue_info_card_renders_the_config_venue_constants(self):
+        html_out = theme.venue_info_card()
+        self.assertIn(html.escape(config.VENUE_NAME), html_out)
+        self.assertIn(html.escape(config.VENUE_ADDRESS), html_out)
+        self.assertIn(html.escape(config.VENUE_PARKING_TEXT), html_out)
+        self.assertIn(html.escape(config.VENUE_DOORS_TEXT), html_out)
+        self.assertIn(html.escape(config.VENUE_HOUSE_RULE_TEXT), html_out)
+        # The venue name must be spelled out only once in the codebase
+        # (VENUE_NAME itself) — VENUE_PARKING_TEXT is derived from it rather
+        # than repeating a second hardcoded copy of the name.
+        self.assertIn(config.VENUE_NAME, config.VENUE_PARKING_TEXT)
+
+    # ── Seats: parse/format helpers (utils.seat_numbers_list / format_seat_numbers /
+    # parse_seat_selection) — cinema-style seat picking, see AGENTS.md/config.SEAT_TIERS ──
+
+    def test_seat_numbers_list_parses_sorts_and_tolerates_garbage(self):
+        self.assertEqual(utils.seat_numbers_list("3,4,17"), [3, 4, 17])
+        self.assertEqual(utils.seat_numbers_list(""), [])
+        self.assertEqual(utils.seat_numbers_list(None), [])
+        # Out of order, duplicated input still comes back sorted and unique.
+        self.assertEqual(utils.seat_numbers_list("17,3,3,4"), [3, 4, 17])
+        # A hand-edited row with one bad entry loses only that entry.
+        self.assertEqual(utils.seat_numbers_list("3,abc,4"), [3, 4])
+
+    def test_format_seat_numbers_sorts_dedupes_and_joins(self):
+        self.assertEqual(utils.format_seat_numbers([17, 3, 4, 3]), "3,4,17")
+        self.assertEqual(utils.format_seat_numbers([]), "")
+        self.assertEqual(utils.format_seat_numbers(None), "")
+        self.assertEqual(utils.format_seat_numbers(["abc", 5]), "5")
+
+    def test_seat_numbers_format_and_parse_round_trip(self):
+        seats = [90, 3, 55, 3]
+        self.assertEqual(
+            utils.seat_numbers_list(utils.format_seat_numbers(seats)), [3, 55, 90]
+        )
+
+    def test_parse_seat_selection_accepts_list_or_string_input(self):
+        self.assertEqual(utils.parse_seat_selection([3, 1, 1]), ([1, 3], ""))
+        self.assertEqual(utils.parse_seat_selection("3, 1 1"), ([1, 3], ""))
+        self.assertEqual(utils.parse_seat_selection(""), ([], ""))
+        self.assertEqual(utils.parse_seat_selection(None), ([], ""))
+
+    def test_parse_seat_selection_reports_invalid_entries(self):
+        self.assertEqual(utils.parse_seat_selection("1, abc"), ([], "invalid"))
+        self.assertEqual(utils.parse_seat_selection([1, "two"]), ([], "invalid"))
+        self.assertEqual(utils.parse_seat_selection([1, 2.5]), ([], "invalid"))
+
+    def test_parse_seat_selection_reports_out_of_range(self):
+        self.assertEqual(
+            utils.parse_seat_selection([0, 5]), ([], "out_of_range")
+        )
+        self.assertEqual(
+            utils.parse_seat_selection([1, config.TOTAL_SEATS + 1]), ([], "out_of_range")
+        )
+
+    # ── Seats: live inventory (taken_seats / available_seats / seat_availability) ──
+
+    def test_seat_numbers_round_trips_through_the_db_and_to_dict(self):
+        session = get_db()
+        try:
+            guest = Guest(
+                name="Round Trip", email="roundtrip@test.com", ticket_count=3,
+                zelle_ref="ZELLE-ROUNDTR1", qr_code=generate_qr_code(),
+                seat_numbers=utils.format_seat_numbers([17, 3, 4]),
+            )
+            session.add(guest)
+            session.commit()
+            gid = guest.id
+        finally:
+            session.close()
+
+        reloaded = get_guest(gid)
+        self.assertEqual(reloaded["seat_numbers"], "3,4,17")
+        self.assertEqual(reloaded["seats"], [3, 4, 17])
+
+    def test_taken_seats_reflects_booked_rows_and_excludes_legacy_rows(self):
+        self._register(name="Seat Booker", email="seatbooker@test.com",
+                       zelle_ref="ZELLE-SEATBK01", seat_numbers=[5, 6, 7])
+        # A legacy-style booking (no seat_numbers) must not contribute seats.
+        self._register(name="Legacy Booker", email="legacybooker@test.com",
+                       ticket_count=4, zelle_ref="ZELLE-LEGACY002")
+        self.assertEqual(utils.taken_seats(), {5, 6, 7})
+
+    def test_available_seats_excludes_taken_seats(self):
+        self._register(name="Avail Seat", email="availseat@test.com",
+                       zelle_ref="ZELLE-AVAILST1", seat_numbers=[1, 2])
+        available = utils.available_seats()
+        self.assertNotIn(1, available)
+        self.assertNotIn(2, available)
+        self.assertIn(3, available)
+        self.assertEqual(len(available), config.TOTAL_SEATS - 2)
+
+    def test_seat_availability_remaining_accounts_for_legacy_tickets(self):
+        """Legacy rows hold no *specific* seat we can name, but they DID
+        consume real capacity — remaining must subtract both, or the venue
+        could be oversold by exactly the legacy headcount."""
+        self._register(name="Seat Taker", email="seattaker@test.com",
+                       zelle_ref="ZELLE-SEATTK01", seat_numbers=[10, 11])
+        self._register(name="Legacy Party", email="legacyparty@test.com",
+                       ticket_count=5, zelle_ref="ZELLE-LEGPARTY1")
+        availability = utils.seat_availability()
+        self.assertEqual(availability["taken"], {10, 11})
+        self.assertEqual(availability["legacy_tickets"], 5)
+        self.assertEqual(availability["total"], config.TOTAL_SEATS)
+        self.assertEqual(availability["remaining"], config.TOTAL_SEATS - 2 - 5)
+        self.assertFalse(availability["sold_out"])
+
+    # ── Seats: register_guest / validate_registration seat-picking path ────
+
+    def test_register_guest_can_book_only_cheap_seats(self):
+        """The core bug this feature fixes: before real seat inventory, the
+        76-100 tier was unreachable unless a booking claimed seats 1..N,
+        which meant buying every expensive seat below it too."""
+        result = self._register(name="Bargain Guest", email="bargain@test.com",
+                                zelle_ref="ZELLE-BARGAIN1", seat_numbers=[90, 91, 92])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["guest"]["ticket_count"], 3)
+        self.assertEqual(result["guest"]["seats"], [90, 91, 92])
+        self.assertEqual(config.seats_total_cents(result["guest"]["seats"]), 3000)
+
+    def test_register_guest_refuses_a_seat_another_booking_already_holds(self):
+        first = self._register(name="First Picker", email="firstpicker@test.com",
+                               zelle_ref="ZELLE-FIRSTPK1", seat_numbers=[20, 21])
+        self.assertTrue(first["ok"])
+
+        second = self._register(name="Second Picker", email="secondpicker@test.com",
+                                zelle_ref="ZELLE-SECONDPK", seat_numbers=[21, 22])
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["reason"], "seats_taken")
+        self.assertEqual(second["taken"], [21])
+        # Named the way the guest saw it on the seat map (config.seat_label(),
+        # "C1"), not the raw stored integer.
+        self.assertIn(config.seat_label(21), second["message"])
+        self.assertEqual(config.seat_label(21), "C1")
+        # The conflicting registration must not have been written at all.
+        self.assertIsNone(utils.get_guest_by_email("secondpicker@test.com"))
+
+    def test_validate_registration_derives_ticket_count_from_seats_and_enforces_names(self):
+        # 3 seats needs 2 additional names — same rule as a 3-ticket quantity
+        # booking, but the count now comes from len(seats).
+        cleaned, errors = validate_registration(
+            name="Seat Picker", email="seatpick@test.com", phone="+1-555-222-3333",
+            plus_one_name="", zelle_ref="ZELLE-SEATVAL1", agree_terms=True,
+            seat_numbers=[5, 6, 7],
+        )
+        self.assertNotIn("seat_numbers", errors)
+        self.assertIn("plus_one_name", errors)
+        self.assertEqual(cleaned["ticket_count"], 3)
+
+        cleaned2, errors2 = validate_registration(
+            name="Seat Picker", email="seatpick@test.com", phone="+1-555-222-3333",
+            plus_one_name="\n".join(_guest_name(i) for i in range(2)),
+            zelle_ref="ZELLE-SEATVAL1", agree_terms=True,
+            seat_numbers=[5, 6, 7],
+        )
+        self.assertNotIn("plus_one_name", errors2)
+        self.assertNotIn("seat_numbers", errors2)
+        self.assertEqual(cleaned2["ticket_count"], 3)
+        self.assertEqual(cleaned2["seat_numbers"], [5, 6, 7])
+        self.assertEqual(cleaned2["seat_numbers_str"], "5,6,7")
+
+    def test_validate_registration_empty_seat_selection_is_an_error(self):
+        cleaned, errors = validate_registration(
+            name="No Seats", email="noseats@test.com", phone="+1-555-222-4444",
+            plus_one_name="", zelle_ref="ZELLE-NOSEATS1", agree_terms=True,
+            seat_numbers=[],
+        )
+        self.assertIn("seat_numbers", errors)
+
+    def test_validate_registration_out_of_range_seat_is_an_error(self):
+        cleaned, errors = validate_registration(
+            name="Bad Seat", email="badseat@test.com", phone="+1-555-222-5555",
+            plus_one_name="", zelle_ref="ZELLE-BADSEAT1", agree_terms=True,
+            seat_numbers=[1, config.TOTAL_SEATS + 1],
+        )
+        self.assertIn("seat_numbers", errors)
+
+    def test_validate_registration_without_seat_numbers_behaves_as_before(self):
+        # seat_numbers left at its default (None): the quantity-based path,
+        # unaffected by seat-picking existing.
+        cleaned, errors = validate_registration(
+            name="Legacy Path", email="legacypath@test.com", phone="+1-555-222-6666",
+            plus_one_name="", zelle_ref="ZELLE-LEGACYPT", agree_terms=True,
+            ticket_count=1,
+        )
+        self.assertNotIn("seat_numbers", cleaned)
+        self.assertNotIn("seat_numbers", errors)
+        self.assertEqual(cleaned["ticket_count"], 1)
+
+    def test_expected_revenue_sums_seat_prices_and_falls_back_for_legacy_rows(self):
+        """A seat-picking booking is priced by its actual seats
+        (config.seats_total_cents); a legacy booking with no recorded seats
+        keeps the old quantity-based pricing (config.booking_total_cents)."""
+        # Seats [1, 30, 80] -> $50 + $25 + $10 = $85.
+        self._register(name="Seat Revenue", email="seatrev@test.com",
+                       zelle_ref="ZELLE-SEATREV1", seat_numbers=[1, 30, 80])
+        # Legacy quantity booking: booking_total_cents(2) = $100.
+        self._register(name="Legacy Revenue", email="legacyrev@test.com",
+                       ticket_count=2, zelle_ref="ZELLE-LEGREV001")
+        stats = get_stats()
+        self.assertEqual(stats["revenue"], 85.0 + 100.0)
 
 
 def run_tests():

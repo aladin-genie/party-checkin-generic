@@ -120,30 +120,166 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(config.ticket_price_dollars(), 50.0)
 
     # ── max_total_tickets ────────────────────────────────────────────────
+    # There are only TOTAL_SEATS (100) real, numbered seats, so the effective
+    # cap can never exceed that regardless of what the secret says — see the
+    # docstring on config.max_total_tickets().
 
-    def test_max_total_tickets_default(self):
+    def test_max_total_tickets_default_is_clamped_to_total_seats(self):
         mock_st = MagicMock()
         mock_st.secrets = {}
         with patch.object(config, "st", mock_st):
-            self.assertEqual(config.max_total_tickets(), 225)
+            self.assertEqual(config.max_total_tickets(), config.TOTAL_SEATS)
 
-    def test_max_total_tickets_from_secret(self):
+    def test_max_total_tickets_from_secret_below_total_seats_passes_through(self):
+        mock_st = MagicMock()
+        mock_st.secrets = {"MAX_TOTAL_TICKETS": "30"}
+        with patch.object(config, "st", mock_st):
+            self.assertEqual(config.max_total_tickets(), 30)
+
+    def test_max_total_tickets_from_secret_above_total_seats_is_clamped(self):
+        # 300 asks for more than exist; there are only TOTAL_SEATS seats to sell.
         mock_st = MagicMock()
         mock_st.secrets = {"MAX_TOTAL_TICKETS": "300"}
         with patch.object(config, "st", mock_st):
-            self.assertEqual(config.max_total_tickets(), 300)
+            self.assertEqual(config.max_total_tickets(), config.TOTAL_SEATS)
 
-    def test_max_total_tickets_zero_disables_cap(self):
+    def test_max_total_tickets_zero_is_capped_at_total_seats_not_unlimited(self):
+        # Real seat inventory retires the old "0 = uncapped" meaning: you
+        # cannot sell a seat that does not exist.
         mock_st = MagicMock()
         mock_st.secrets = {"MAX_TOTAL_TICKETS": "0"}
         with patch.object(config, "st", mock_st):
-            self.assertEqual(config.max_total_tickets(), 0)
+            self.assertEqual(config.max_total_tickets(), config.TOTAL_SEATS)
 
-    def test_max_total_tickets_garbage_falls_back_to_default(self):
+    def test_max_total_tickets_negative_is_also_capped_at_total_seats(self):
+        mock_st = MagicMock()
+        mock_st.secrets = {"MAX_TOTAL_TICKETS": "-5"}
+        with patch.object(config, "st", mock_st):
+            self.assertEqual(config.max_total_tickets(), config.TOTAL_SEATS)
+
+    def test_max_total_tickets_garbage_falls_back_to_default_then_clamped(self):
         mock_st = MagicMock()
         mock_st.secrets = {"MAX_TOTAL_TICKETS": "not-a-number"}
         with patch.object(config, "st", mock_st):
-            self.assertEqual(config.max_total_tickets(), 225)
+            self.assertEqual(config.max_total_tickets(), config.TOTAL_SEATS)
+
+    # ── Seat inventory: TOTAL_SEATS / all_seat_numbers / seats_total_cents ──
+
+    def test_total_seats_derived_from_seat_tiers_max_boundary(self):
+        with patch.object(config, "SEAT_TIERS", ((1, 25, 5000), (26, 75, 2500), (76, 100, 1000))):
+            self.assertEqual(
+                max((end for _s, end, _p in config.SEAT_TIERS), default=0), 100
+            )
+
+    def test_all_seat_numbers_spans_1_to_total_seats(self):
+        with patch.object(config, "TOTAL_SEATS", 5):
+            self.assertEqual(config.all_seat_numbers(), [1, 2, 3, 4, 5])
+
+    def test_seats_total_cents_prices_a_non_contiguous_pick(self):
+        """The core bug fix: a guest can now buy only cheap seats, and a
+        mixed pick prices each seat at its own tier."""
+        self.assertEqual(
+            config.seats_total_cents([1, 30, 80]), 5000 + 2500 + 1000
+        )
+
+    def test_seats_total_cents_only_cheap_seats(self):
+        self.assertEqual(config.seats_total_cents([90, 91, 92]), 3000)
+
+    def test_seats_total_cents_deduplicates(self):
+        self.assertEqual(config.seats_total_cents([1, 1, 1]), config.seat_price_cents(1))
+
+    def test_seats_total_cents_ignores_garbage_and_out_of_range(self):
+        self.assertEqual(
+            config.seats_total_cents([1, "abc", None, 0, 9999, 30]),
+            config.seat_price_cents(1) + config.seat_price_cents(30),
+        )
+
+    def test_seats_total_cents_never_raises_on_a_non_iterable(self):
+        self.assertEqual(config.seats_total_cents(None), 0)
+
+    def test_seat_tier_index_matches_each_configured_tier(self):
+        with patch.object(config, "SEAT_TIERS", ((1, 25, 5000), (26, 75, 2500), (76, 100, 1000))):
+            self.assertEqual(config.seat_tier_index(1), 0)
+            self.assertEqual(config.seat_tier_index(25), 0)
+            self.assertEqual(config.seat_tier_index(26), 1)
+            self.assertEqual(config.seat_tier_index(100), 2)
+
+    def test_seat_tier_index_is_negative_one_when_unconfigured(self):
+        with patch.object(config, "SEAT_TIERS", ((1, 5, 5000),)):
+            self.assertEqual(config.seat_tier_index(10), -1)
+        self.assertEqual(config.seat_tier_index("not-a-seat"), -1)
+
+    def test_every_seat_is_covered_by_an_explicit_tier(self):
+        """seat_price_cents() falls back to the BASE (most expensive) price
+        for any seat number outside every tier — if a real seat were missing
+        from SEAT_TIERS it would silently be charged the premium seat-1 rate
+        instead of whatever it should actually cost. Every seat that exists
+        must be explicitly covered, with no gaps."""
+        for seat in config.all_seat_numbers():
+            covered = any(start <= seat <= end for start, end, _price in config.SEAT_TIERS)
+            self.assertTrue(
+                covered,
+                f"seat {seat} has no explicit SEAT_TIERS entry and would fall back "
+                "to the base price",
+            )
+
+    # ── Seat labels: seat_label / seat_from_label / format_seat_labels ─────
+
+    def test_seat_label_first_seat_of_the_grid(self):
+        self.assertEqual(config.seat_label(1), "A1")
+
+    def test_seat_label_mid_row_seat(self):
+        self.assertEqual(config.seat_label(17), "B7")
+
+    def test_seat_label_row_boundary(self):
+        """Seat 10 is the last seat of row A; seat 11 rolls over into row B."""
+        self.assertEqual(config.seat_label(10), "A10")
+        self.assertEqual(config.seat_label(11), "B1")
+
+    def test_seat_label_past_row_26_uses_double_letters(self):
+        """With a larger seat block (patched here), row 27 (0-indexed 26)
+        must roll over to "AA" rather than breaking, the same way a
+        spreadsheet's column headers do."""
+        with patch.object(config, "TOTAL_SEATS", 300):
+            self.assertEqual(config.seat_label(261), "AA1")
+            self.assertEqual(config.seat_label(270), "AA10")
+            self.assertEqual(config.seat_label(271), "AB1")
+
+    def test_seat_label_tolerates_garbage_without_raising(self):
+        self.assertEqual(config.seat_label("not-a-seat"), "not-a-seat")
+        self.assertEqual(config.seat_label(None), "None")
+        self.assertEqual(config.seat_label(0), "0")
+        self.assertEqual(config.seat_label(-5), "-5")
+
+    def test_seat_from_label_round_trips_seat_label(self):
+        for seat in (1, 10, 11, 17, 25, 50, 100):
+            self.assertEqual(config.seat_from_label(config.seat_label(seat)), seat)
+
+    def test_seat_from_label_round_trips_past_row_26(self):
+        with patch.object(config, "TOTAL_SEATS", 300):
+            for seat in (261, 270, 271, 300):
+                self.assertEqual(config.seat_from_label(config.seat_label(seat)), seat)
+
+    def test_seat_from_label_is_case_insensitive_and_tolerates_whitespace(self):
+        self.assertEqual(config.seat_from_label(" b7 "), 17)
+        self.assertEqual(config.seat_from_label("B7"), 17)
+
+    def test_seat_from_label_tolerates_garbage_without_raising(self):
+        self.assertIsNone(config.seat_from_label(None))
+        self.assertIsNone(config.seat_from_label(123))
+        self.assertIsNone(config.seat_from_label(""))
+        self.assertIsNone(config.seat_from_label("not a label"))
+        self.assertIsNone(config.seat_from_label("Z999"))  # column past SEAT_COLS
+        self.assertIsNone(config.seat_from_label("ZZ1"))  # row past TOTAL_SEATS
+        self.assertIsNone(config.seat_from_label("7B"))  # digits before letters
+
+    def test_format_seat_labels_sorts_dedupes_and_labels(self):
+        self.assertEqual(config.format_seat_labels([17, 3, 4, 4]), "A3, A4, B7")
+
+    def test_format_seat_labels_tolerates_garbage_without_raising(self):
+        self.assertEqual(config.format_seat_labels(None), "")
+        self.assertEqual(config.format_seat_labels(42), "")  # non-iterable
+        self.assertEqual(config.format_seat_labels([1, "abc", None]), config.seat_label(1))
 
     # ── zelle_info ───────────────────────────────────────────────────────
 
@@ -195,13 +331,30 @@ class TestConfig(unittest.TestCase):
     def test_qr_prefix_derived_from_event_year(self):
         self.assertEqual(config.qr_prefix(), f"PARTY{config.EVENT_DATE.year}")
 
+    # ── Seat-selection policy copy ──────────────────────────────────────
+
+    def test_kids_and_food_policy_text_state_the_two_facts(self):
+        """theme.seat_policy_chips() reads these verbatim, so the facts
+        themselves have to live here — and must not overreach into the
+        still-open question of whether a free child holds a reserved seat."""
+        self.assertIn("free", config.KIDS_POLICY_TEXT.lower())
+        self.assertIn("12", config.KIDS_POLICY_TEXT)
+        self.assertNotIn("seat", config.KIDS_POLICY_TEXT.lower())
+        self.assertIn("purchase", config.FOOD_POLICY_TEXT.lower())
+        self.assertIn("venue", config.FOOD_POLICY_TEXT.lower())
+
     # ── Check-in window: event_start_utc / checkin_opens_at_utc ────────────
 
     def test_event_start_utc_matches_expected_cdt_offset(self):
-        # EVENT_START_LOCAL is 5:00 PM on Oct 3, 2026, in America/Chicago.
-        # Oct 3 is within Central Daylight Time (CDT, UTC-5), so this must
-        # convert to 10:00 PM UTC.
-        self.assertEqual(config.event_start_utc(), datetime(2026, 10, 3, 22, 0))
+        # Oct 3 is within Central Daylight Time (CDT, UTC-5), so the local
+        # start time must convert to UTC by adding exactly 5 hours. Derived
+        # from EVENT_START_LOCAL rather than hardcoded, so moving the event
+        # time (5 PM -> 6 PM, as happened once) can't leave this asserting a
+        # stale instant that no longer matches the app.
+        self.assertEqual(
+            config.event_start_utc(),
+            config.EVENT_START_LOCAL + timedelta(hours=5),
+        )
 
     def test_checkin_opens_at_utc_gap_equals_lead_hours(self):
         gap = config.event_start_utc() - config.checkin_opens_at_utc()

@@ -9,6 +9,7 @@ both so there is exactly one place to update them.
 """
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 try:
@@ -52,7 +53,7 @@ EVENT_NAME = "DFW Yakshagana Havyasis"
 EVENT_SUBTITLE = "Prasanga — Sri Devi Mahathme"
 EVENT_TAGLINE = "Promoting Yakshagana Art in North America"
 EVENT_DATE = datetime(2026, 10, 3)
-EVENT_TIME_TEXT = "5:00 PM onwards"
+EVENT_TIME_TEXT = "6:00 PM onwards"
 EVENT_DATE_TEXT = "Saturday, October 3, 2026"
 EVENT_DATE_SHORT = "Sat, Oct 3, 2026"
 
@@ -65,8 +66,47 @@ EVENT_THEME_NOTE = "Traditional attire & face paint encouraged"
 # Optional local-language tagline shown under the tagline on the hero.
 EVENT_TAGLINE_LOCAL = "ಅದ್ಭುತ ದೇವಿ ಮಹಾತ್ಮೆ — ಯಕ್ಷಗಾನ ಪ್ರಸಂಗ"
 
+# The specific performance being staged this evening, e.g. "Sri Devi
+# Mahathme" — the last " — "-separated segment of EVENT_SUBTITLE.
+# EVENT_SUBTITLE is flyer-style ("Prasanga — Sri Devi Mahathme": "Prasanga"
+# is the generic Yakshagana word for "the story being performed", not part
+# of the title itself), but a guest scanning open browser tabs is looking
+# for the actual performance name, not that category prefix. Falls back to
+# the whole of EVENT_SUBTITLE if it has no "—" to split on (e.g. the copy
+# is ever simplified to just a bare title), so this is never blank while
+# EVENT_SUBTITLE is set.
+_performance_title = EVENT_SUBTITLE.rsplit("—", 1)[-1].strip() if EVENT_SUBTITLE else ""
+
+# Browser tab title. Built here — not as an f-string in streamlit_app.py —
+# so there is exactly one place that decides it, per this module's "single
+# source of truth for event strings" job. It leads with the performance
+# name, since that's what a guest hunting through open tabs is looking for,
+# with EVENT_NAME (the organisation) as trailing context. Falls back to the
+# old "<org> — Check-In" form if EVENT_SUBTITLE is ever blanked.
+# streamlit_app.py's set_page_config() cannot reach this constant at all
+# when config itself failed to import — it falls back to a bare "Check-In"
+# string on its own in that case.
+PAGE_TITLE = f"{_performance_title} — {EVENT_NAME}" if _performance_title else f"{EVENT_NAME} — Check-In"
+
 VENUE_NAME = "Unity of Dallas"
 VENUE_ADDRESS = "6525 Forest Lane, Dallas, TX 75230"
+
+# Venue logistics shown in theme.venue_info_card() on the Register page.
+# Kept here (not hand-typed in theme.py) so VENUE_NAME appears exactly once
+# in the codebase and the parking line can never mention a different venue
+# than the one guests are actually registering for.
+VENUE_PARKING_TEXT = f"Free parking on the {VENUE_NAME} campus."
+VENUE_DOORS_TEXT = f"The program begins at {EVENT_TIME_TEXT} — arrive early for parking and seating."
+VENUE_HOUSE_RULE_TEXT = "The building must be cleared by 10:00 PM."
+
+# Two facts a guest choosing seats must not miss — surfaced as their own
+# chips next to the seat picker (see theme.seat_policy_chips()) rather than
+# buried in a paragraph, per the same "one home for event copy" rule as the
+# VENUE_* text above. Deliberately limited to just these two stated facts:
+# whether a free child holds their own reserved seat is still an open
+# question for the organiser, so this copy does not answer it either way.
+KIDS_POLICY_TEXT = "Kids under age 12 are free."
+FOOD_POLICY_TEXT = "Vegetarian food is available for purchase at the venue."
 
 APP_VERSION = "1.0-generic"
 
@@ -98,7 +138,7 @@ LANDING_PAGE = "Register"
 # Optional: utils.resolve_image_src() returns "" for anything it can't
 # resolve, so blanking this (or deleting the file) makes both call sites
 # render nothing rather than break.
-EVENT_FLYER = "assets/prasanga-flyer.jpg"
+EVENT_FLYER = "assets/prasanga-flyer.webp"
 
 
 # The gallery. Add real photos before the event. Each entry is either a
@@ -108,15 +148,17 @@ EVENT_FLYER = "assets/prasanga-flyer.jpg"
 # HTTP. Anything it cannot resolve is dropped rather than rendered as a broken
 # image.
 #
-# Order is display order, so the strongest real photo leads. The event flyer
-# leads because it's the most current, detailed visual for this specific
-# Prasanga.
+# Order is display order, so the strongest real photo leads.
+#
+# Do NOT list EVENT_FLYER here. Home already renders it above this gallery
+# via theme.flyer_card(), and every local image is base64-inlined into the
+# page HTML — which Streamlit re-sends on every rerun. Listing the flyer in
+# both places inlined the same image twice and pushed Home to ~2.5MB of HTML
+# per interaction, most of it one duplicated poster.
 PHOTOS = [
-    {"src": "assets/prasanga-flyer.jpg",
-     "caption": "Prasanga — Sri Devi Mahathme | October 3, 2026"},
-    {"src": "assets/photos/yakshagana-on-stage.jpg",
+    {"src": "assets/photos/yakshagana-on-stage.webp",
      "caption": "Yakshagana on stage — dance, drama, and devotion"},
-    {"src": "assets/photos/yakshagana-krishna.jpg",
+    {"src": "assets/photos/yakshagana-krishna.webp",
      "caption": "The vibrant art of Yakshagana from Karnataka"},
 ]
 
@@ -173,6 +215,34 @@ def ticket_price_dollars() -> float:
 #
 # Boundaries are INCLUSIVE. The seat map on the Register page shows the
 # tiers so guests know exactly what they are paying before they Zelle.
+#
+# These seats are REAL, individually-bookable inventory, not a display
+# convenience: TOTAL_SEATS below is DERIVED from the highest seat number
+# covered by the LAST tier here, and that derived number is the hard cap on
+# how many tickets this app will ever sell (see max_total_tickets()). So
+# this tuple is the one place that decides the size of the bookable block —
+# extending the top tier's end (or adding a new tier past it) grows
+# TOTAL_SEATS, the cap, and the seat map together.
+#
+# The venue (Unity of Dallas) actually seats roughly 850 people, but no
+# public seating chart for its sanctuary publishes real rows/sections, so
+# this table intentionally does NOT try to model the real room — it only
+# claims the 100 seats the organiser has actually priced off the printed
+# flyer ($50 / $25 / $10). Selling a bigger block is a pricing decision only
+# the organiser can make (which band do the other ~750 seats belong to?),
+# not something to guess at here. To open up more seats, the organiser must
+# extend these tiers (or add a new one) to cover as many seats as they want
+# to sell — TOTAL_SEATS and the cap follow automatically.
+#
+# seat_price_cents() falls back to the BASE price (TICKET_PRICE_CENTS —
+# seat 1's price, the most expensive tier) for any seat number that isn't
+# covered by a tier below. That fallback exists so a garbage/out-of-range
+# lookup never raises, but it also means these tiers MUST cover every seat
+# that actually exists (every seat in all_seat_numbers(), i.e. 1..
+# TOTAL_SEATS) — otherwise a real seat past the last tier would silently be
+# charged the PREMIUM rate instead of falling cheaper as expected.
+# test_every_seat_is_covered_by_an_explicit_tier (test_config.py) enforces
+# this; keep it passing when editing these tiers.
 SEAT_TIERS = (
     (1, 25, 5000),    # seats 1–25: $50.00 each
     (26, 75, 2500),   # seats 26–75: $25.00 each
@@ -216,6 +286,13 @@ def ticket_price_dollars_for(ticket_count) -> float:
 def booking_total_cents(ticket_count) -> int:
     """Total cost in cents for seats 1..`ticket_count`.
 
+    This is the LEGACY/quantity-based pricing path, for bookings that carry
+    no explicit seat numbers (a guest who picked a quantity rather than
+    individual seats). A seat-picking booking must be priced with
+    seats_total_cents() instead — it charges the sum of the SPECIFIC seats
+    actually held, which need not be 1..N once seats can be picked
+    individually rather than always starting at seat 1.
+
     Integer cents throughout — the amount a guest is told to Zelle must not
     drift by a rounding error.
     """
@@ -255,6 +332,50 @@ def price_tiers() -> list:
     ]
 
 
+def _format_tier_dollars(cents: int) -> str:
+    """Whole-dollar formatting for a tier price ("$50"), falling back to
+    cents only if the price is not a round dollar amount."""
+    dollars = cents / 100
+    if dollars == int(dollars):
+        return f"${dollars:,.0f}"
+    return f"${dollars:,.2f}"
+
+
+def _tier_range_words(tier: dict) -> str:
+    """Plain-text seat-range label for one tier, e.g. "1–25" or "26+"."""
+    low, high = tier["min"], tier["max"]
+    if high is None:
+        return f"{low}+"
+    return f"{low}–{high}" if high > low else str(low)
+
+
+def seat_pricing_summary() -> str:
+    """One human-readable sentence describing every seat-price tier.
+
+    Built from price_tiers() (which reads SEAT_TIERS) rather than being
+    hand-written, so the Register page's slider help text can never drift
+    from the prices guests are actually charged — see the $20/$30 stale-price
+    lesson in AGENTS.md for why that guarantee matters.
+
+    e.g. "Seats 1–25 are $50, 26–75 are $25, and 76–100 are $10."
+    """
+    tiers = price_tiers()
+    if not tiers:
+        return ""
+
+    clauses = [
+        f"{_tier_range_words(tier)} are {_format_tier_dollars(tier['price_cents'])}"
+        for tier in tiers
+    ]
+    if len(clauses) == 1:
+        joined = clauses[0]
+    elif len(clauses) == 2:
+        joined = f"{clauses[0]} and {clauses[1]}"
+    else:
+        joined = ", ".join(clauses[:-1]) + f", and {clauses[-1]}"
+    return f"Seats {joined}."
+
+
 def next_price_tier(ticket_count):
     """The next cheaper seat tier a booking could reach, or None.
 
@@ -275,6 +396,225 @@ def next_price_tier(ticket_count):
     return None
 
 
+# ── Seat inventory ───────────────────────────────────────────────────────────
+# Seats are REAL, individually-bookable inventory, cinema style: a guest
+# picks specific seat numbers rather than just a quantity, so there must be
+# exactly one place that says how many numbered seats actually exist.
+
+# Derived from SEAT_TIERS rather than hardcoded, so raising/lowering the top
+# tier's boundary automatically raises/lowers the real seat count everywhere
+# that reads TOTAL_SEATS instead of the two having to be kept in sync by hand.
+TOTAL_SEATS = max((end for _start, end, _price in SEAT_TIERS), default=0)
+
+
+def all_seat_numbers() -> list:
+    """Return every seat number that exists, in order: [1..TOTAL_SEATS]."""
+    return list(range(1, TOTAL_SEATS + 1))
+
+
+# ── Seat labels (display only) ────────────────────────────────────────────────
+# Real auditorium seats are row-lettered (A1, A2, ... B1, ...) — that is what
+# a guest expects to be told at the door, not a bare integer 1..100. But no
+# public seating chart for the Unity of Dallas sanctuary (~850 seats) shows
+# its actual rows/sections, so this does not try to model the real room.
+# Instead the map is a CONFIGURABLE rectangle: SEAT_COLS seats per row, with
+# as many rows as TOTAL_SEATS needs. This whole section is a DISPLAY layer
+# only — the integer seat number remains the stored identity everywhere else
+# (Guest.seat_numbers, the DB, logs, the backup export). Nothing here changes
+# what gets written to the database.
+SEAT_COLS = 10
+
+
+def seat_row_label(row_index) -> str:
+    """0-based seat-map row index -> row letter: 0 -> "A", 25 -> "Z",
+    26 -> "AA", 27 -> "AB", ... — the same base-26 scheme spreadsheets use
+    for column headers, so the map keeps working if the block is ever made
+    larger than 26 rows.
+
+    Must never raise: a negative or non-numeric index clamps to row 0
+    ("A") rather than raising, since this only ever feeds a label a human
+    reads.
+    """
+    try:
+        n = int(row_index)
+    except (TypeError, ValueError):
+        n = 0
+    n = max(0, n) + 1  # 1-indexed algorithm: A=1, Z=26, AA=27, ...
+    letters = ""
+    while n > 0:
+        n, remainder = divmod(n - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def _row_index_for_label(letters: str):
+    """Inverse of seat_row_label(): "A" -> 0, "Z" -> 25, "AA" -> 26.
+
+    Returns None for anything that isn't purely A-Z letters (case
+    insensitive) — never raises.
+    """
+    if not letters:
+        return None
+    n = 0
+    for ch in letters.upper():
+        if not ("A" <= ch <= "Z"):
+            return None
+        n = n * 26 + (ord(ch) - 64)
+    return n - 1
+
+
+# Precomputed row letters for the CURRENT seat grid — a convenience list for
+# callers that just want "every row letter in order" (e.g. theme.seat_map()'s
+# row gutter). seat_label()/seat_from_label() below call seat_row_label()/
+# _row_index_for_label() directly rather than indexing into this tuple, so
+# they stay correct even if SEAT_COLS or TOTAL_SEATS is patched (e.g. in a
+# test) without this tuple being recomputed.
+SEAT_ROWS = (TOTAL_SEATS + SEAT_COLS - 1) // SEAT_COLS if SEAT_COLS > 0 else 0
+SEAT_ROW_LETTERS = tuple(seat_row_label(i) for i in range(SEAT_ROWS))
+
+_SEAT_LABEL_RE = re.compile(r"^\s*([A-Za-z]+)\s*(\d+)\s*$")
+
+
+def seat_label(seat_number) -> str:
+    """Venue-style seat label for a stored integer seat number.
+
+    e.g. seat_label(1) -> "A1", seat_label(11) -> "B1" (row boundary),
+    seat_label(17) -> "B7". Rows are SEAT_COLS seats wide (default 10);
+    row letters come from seat_row_label() above.
+
+    This is a DISPLAY-ONLY conversion — the integer remains the stored
+    identity (Guest.seat_numbers, the DB). Must never raise: a garbage or
+    non-positive input falls back to the plain string form of whatever was
+    passed in, so a caller showing this to a human never breaks over a bad
+    seat value.
+    """
+    try:
+        n = int(seat_number)
+    except (TypeError, ValueError):
+        return str(seat_number)
+    cols = SEAT_COLS
+    try:
+        cols = int(cols)
+    except (TypeError, ValueError):
+        cols = 10
+    if n < 1 or cols < 1:
+        return str(seat_number)
+    row_index, col = divmod(n - 1, cols)
+    return f"{seat_row_label(row_index)}{col + 1}"
+
+
+def seat_from_label(label):
+    """Inverse of seat_label(): "B7" -> 17 (for the default SEAT_COLS=10).
+
+    Returns None — never raises — for anything that doesn't parse as
+    <letters><digits>, a column outside 1..SEAT_COLS, a row-letter sequence
+    that doesn't map to a real row index, or a seat number outside
+    1..TOTAL_SEATS.
+    """
+    try:
+        text = str(label).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    match = _SEAT_LABEL_RE.match(text)
+    if not match:
+        return None
+    letters, digits = match.group(1), match.group(2)
+    cols = SEAT_COLS
+    try:
+        cols = int(cols)
+    except (TypeError, ValueError):
+        cols = 10
+    try:
+        col = int(digits)
+    except (TypeError, ValueError):
+        return None
+    if cols < 1 or col < 1 or col > cols:
+        return None
+    row_index = _row_index_for_label(letters)
+    if row_index is None or row_index < 0:
+        return None
+    seat_number = row_index * cols + col
+    if seat_number < 1 or seat_number > TOTAL_SEATS:
+        return None
+    return seat_number
+
+
+def format_seat_labels(seats) -> str:
+    """Comma-joined human seat labels for a list of seat numbers, e.g.
+    [17, 3, 4] -> "A3, A4, B7".
+
+    Sorted ascending by the underlying seat NUMBER (not lexicographically by
+    label — "A2" would otherwise sort after "A10") and de-duplicated. This
+    is the human-facing counterpart to utils.format_seat_numbers() (the
+    stored/DB integer form) — every place a guest or door staff reads a seat
+    list should go through this rather than hand-rolling the join again.
+    Must never raise: a non-iterable input returns "", a non-integer entry
+    is silently skipped.
+    """
+    try:
+        candidates = list(seats or [])
+    except TypeError:
+        return ""
+    cleaned = set()
+    for s in candidates:
+        try:
+            cleaned.add(int(s))
+        except (TypeError, ValueError):
+            continue
+    return ", ".join(seat_label(n) for n in sorted(cleaned))
+
+
+def seats_total_cents(seats) -> int:
+    """Total price in cents for a specific, possibly non-contiguous set of
+    seat numbers, e.g. [1, 30, 80] -> seat_price_cents(1) + seat_price_cents(30)
+    + seat_price_cents(80).
+
+    This is what a seat-PICKING booking is actually charged — unlike
+    booking_total_cents(), the seats need not be contiguous or start at 1,
+    since a guest can now choose any set of open seats (including only the
+    cheap ones, e.g. [90, 91, 92]).
+
+    Must never raise: a non-integer or out-of-range entry is silently
+    dropped rather than raising or falling back to the base price, on the
+    assumption that the seats reaching here were already validated by
+    utils.parse_seat_selection() — pricing garbage input would be worse than
+    ignoring it. De-duplicates before summing so a seat listed twice is only
+    charged once. Integer cents throughout.
+    """
+    cleaned = set()
+    try:
+        candidates = list(seats)
+    except TypeError:
+        return 0
+    for seat in candidates:
+        try:
+            n = int(seat)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= n <= TOTAL_SEATS:
+            cleaned.add(n)
+    return sum(seat_price_cents(n) for n in cleaned)
+
+
+def seat_tier_index(seat_number) -> int:
+    """Which SEAT_TIERS entry a seat number falls in, or -1 if none.
+
+    Exists so the seat-map's tier -> colour mapping lives here instead of
+    being re-derived from SEAT_TIERS's ranges in the UI layer, where it could
+    silently drift out of step with a future change to the tiers.
+    """
+    try:
+        n = int(seat_number)
+    except (TypeError, ValueError):
+        return -1
+    for index, (start, end, _price) in enumerate(SEAT_TIERS):
+        if start <= n <= end:
+            return index
+    return -1
+
+
 # ── Ticket capacity ──────────────────────────────────────────────────────────
 # The venue holds a fixed number of people, so unlike the concurrency guard
 # below (which only throttles simultaneous *browsing*), this is a real, hard
@@ -286,10 +626,22 @@ def max_total_tickets() -> int:
     Once this many tickets are registered the Register page shows a sold-out
     screen instead of the form, and utils.register_guest() refuses to write
     past it. Tunable via the MAX_TOTAL_TICKETS secret so the organiser can
-    raise or lower the cap without a redeploy; 0 (or negative) disables the
-    cap entirely and restores unlimited registration.
+    raise or lower the cap without a redeploy.
+
+    The effective cap can never exceed TOTAL_SEATS: seats are now real,
+    individually-numbered inventory (see SEAT_TIERS), so there are only
+    TOTAL_SEATS physical seats to sell no matter what the secret says — a
+    secret above TOTAL_SEATS is clamped down to it. The secret's old
+    "0 (or negative) disables the cap entirely" meaning is retired for the
+    same reason: with real seat inventory there is no such thing as
+    unlimited, since you cannot sell a seat that does not exist. A secret of
+    0 or below is therefore also treated as "capped at TOTAL_SEATS" rather
+    than uncapped.
     """
-    return get_secret_int("MAX_TOTAL_TICKETS", 225)
+    raw = get_secret_int("MAX_TOTAL_TICKETS", 225)
+    if raw <= 0:
+        return TOTAL_SEATS
+    return min(raw, TOTAL_SEATS)
 
 
 # Most tickets one guest may claim in a single registration. The Register page
@@ -363,7 +715,7 @@ def qr_prefix() -> str:
 # for the persistent admin override that can force it open/closed).
 
 EVENT_TIMEZONE = "America/Chicago"
-EVENT_START_LOCAL = datetime(2026, 10, 3, 17, 0)  # 5:00 PM onwards
+EVENT_START_LOCAL = datetime(2026, 10, 3, 18, 0)  # 6:00 PM onwards, matches the printed flyer
 CHECKIN_LEAD_HOURS = 2
 
 # Used only if the system tz database is unavailable (see _event_start_local_aware).
