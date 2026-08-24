@@ -198,10 +198,10 @@ class TestConfig(unittest.TestCase):
     # ── Check-in window: event_start_utc / checkin_opens_at_utc ────────────
 
     def test_event_start_utc_matches_expected_cdt_offset(self):
-        # EVENT_START_LOCAL is 5:30 PM on Jan 1, 2027, in America/Chicago.
-        # Jan 1 is within Central Standard Time (CST, UTC-6), so this must
-        # convert to 11:30 PM UTC -- not the CDT (UTC-5) offset.
-        self.assertEqual(config.event_start_utc(), datetime(2027, 1, 1, 23, 30))
+        # EVENT_START_LOCAL is 5:00 PM on Oct 3, 2026, in America/Chicago.
+        # Oct 3 is within Central Daylight Time (CDT, UTC-5), so this must
+        # convert to 10:00 PM UTC.
+        self.assertEqual(config.event_start_utc(), datetime(2026, 10, 3, 22, 0))
 
     def test_checkin_opens_at_utc_gap_equals_lead_hours(self):
         gap = config.event_start_utc() - config.checkin_opens_at_utc()
@@ -212,7 +212,7 @@ class TestConfig(unittest.TestCase):
         self.assertIsInstance(text, str)
         self.assertGreater(len(text), 0)
         # Should mention the event day/year somewhere in the rendered text.
-        self.assertIn("2027", text)
+        self.assertIn("2026", text)
 
     def test_event_start_utc_never_raises_when_tz_database_missing(self):
         with patch.object(config, "ZoneInfo", None):

@@ -594,14 +594,15 @@ def page_register():
         st.session_state["reg_veg_count"] = ticket_count
     if st.session_state.get("reg_non_veg_count", 0) > ticket_count:
         st.session_state["reg_non_veg_count"] = ticket_count
-    # A fresh solo booking defaults to 1 veg / 0 non-veg, which is already a
-    # valid meal count and needs no action from the guest.
-    st.session_state.setdefault("reg_veg_count", ticket_count)
+    # Food is available for purchase at the venue, so a fresh booking defaults
+    # to 0 meals until the guest decides what they want.
+    st.session_state.setdefault("reg_veg_count", 0)
     st.session_state.setdefault("reg_non_veg_count", 0)
 
     st.markdown(
         theme.section_header(
-            "Meal Count", "Veg + non-veg must add up to your ticket count — this is our catering headcount."
+            "Meal Preferences",
+            "Food is available for purchase at the venue. Let us know your preferences so we can plan catering."
         ),
         unsafe_allow_html=True,
     )

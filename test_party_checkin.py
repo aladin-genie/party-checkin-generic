@@ -186,7 +186,7 @@ class TestPartyCheckIn(unittest.TestCase):
         session.commit()
         
         self.assertIsNotNone(guest.id)
-        self.assertTrue(guest.qr_code.startswith("PARTY2027-"))
+        self.assertTrue(guest.qr_code.startswith("PARTY2026-"))
         self.assertFalse(guest.checked_in)
         session.close()
     
@@ -1694,9 +1694,9 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(cleaned["plus_one_name"], "Ann Lee\nBob Ray")
         self.assertEqual(cleaned["additional_guest_count"], 2)
 
-    # ── Meal counts must match the ticket count ─────────────────────────────
-    # Veg + non-veg doubles as the catering headcount, so it must sum to
-    # exactly ticket_count — same reasoning as the guest-names check above.
+    # ── Meal counts are optional planning preferences ───────────────────────
+    # Food is available for purchase at the venue, so veg + non-veg may be 0
+    # up to ticket_count. Only more meals than tickets is rejected.
 
     def _food_check(self, ticket_count, veg_count, non_veg_count, email):
         """validate_registration with everything but the food count valid."""
@@ -1713,10 +1713,15 @@ class TestPartyCheckIn(unittest.TestCase):
         self.assertEqual(cleaned["veg_count"], 2)
         self.assertEqual(cleaned["non_veg_count"], 2)
 
-    def test_validate_registration_too_few_meals_rejected(self):
-        cleaned, errors = self._food_check(4, 1, 1, "toofewmeals@example.com")
-        self.assertIn("food_count", errors)
-        self.assertIn("4", errors["food_count"])
+    def test_validate_registration_zero_meals_accepted(self):
+        cleaned, errors = self._food_check(4, 0, 0, "nomeals@example.com")
+        self.assertNotIn("food_count", errors)
+        self.assertEqual(cleaned["veg_count"], 0)
+        self.assertEqual(cleaned["non_veg_count"], 0)
+
+    def test_validate_registration_fewer_meals_than_tickets_accepted(self):
+        cleaned, errors = self._food_check(4, 1, 1, "fewermeals@example.com")
+        self.assertNotIn("food_count", errors)
 
     def test_validate_registration_too_many_meals_rejected(self):
         cleaned, errors = self._food_check(2, 2, 2, "toomanymeals@example.com")

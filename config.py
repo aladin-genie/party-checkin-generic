@@ -49,11 +49,12 @@ def get_secret_int(key: str, default: int) -> int:
 # ── Event Details ────────────────────────────────────────────────────────────
 
 EVENT_NAME = "DFW Yakshagana Havyasis"
+EVENT_SUBTITLE = "Prasanga — Sri Devi Mahathme"
 EVENT_TAGLINE = "Promoting Yakshagana Art in North America"
-EVENT_DATE = datetime(2027, 1, 1)
-EVENT_TIME_TEXT = "TBD"
-EVENT_DATE_TEXT = "Friday, January 1, 2027"
-EVENT_DATE_SHORT = "Fri, Jan 1, 2027"
+EVENT_DATE = datetime(2026, 10, 3)
+EVENT_TIME_TEXT = "5:00 PM onwards"
+EVENT_DATE_TEXT = "Saturday, October 3, 2026"
+EVENT_DATE_SHORT = "Sat, Oct 3, 2026"
 
 # Dress-up theme for the event. Drives the app's whole look (see theme.py) as
 # well as the badge on the hero, so guests arriving from the flyer land
@@ -62,10 +63,10 @@ EVENT_THEME = "Yakshagana"
 EVENT_THEME_NOTE = "Traditional attire & face paint encouraged"
 
 # Optional local-language tagline shown under the tagline on the hero.
-EVENT_TAGLINE_LOCAL = "ಯಕ್ಷಗಾನ — ಕರ್ನಾಟಕದ ಗೌರವ"
+EVENT_TAGLINE_LOCAL = "ಅದ್ಭುತ ದೇವಿ ಮಹಾತ್ಮೆ — ಯಕ್ಷಗಾನ ಪ್ರಸಂಗ"
 
-VENUE_NAME = "DFW Metroplex Venue TBD"
-VENUE_ADDRESS = "DFW Metroplex, TX (address TBD)"
+VENUE_NAME = "Unity of Dallas"
+VENUE_ADDRESS = "6525 Forest Lane, Dallas, TX 75230"
 
 APP_VERSION = "1.0-generic"
 
@@ -97,7 +98,7 @@ LANDING_PAGE = "Register"
 # Optional: utils.resolve_image_src() returns "" for anything it can't
 # resolve, so blanking this (or deleting the file) makes both call sites
 # render nothing rather than break.
-EVENT_FLYER = ""
+EVENT_FLYER = "assets/prasanga-flyer.jpg"
 
 
 # The gallery. Add real photos before the event. Each entry is either a
@@ -107,8 +108,12 @@ EVENT_FLYER = ""
 # HTTP. Anything it cannot resolve is dropped rather than rendered as a broken
 # image.
 #
-# Order is display order, so the strongest real photo leads.
+# Order is display order, so the strongest real photo leads. The event flyer
+# leads because it's the most current, detailed visual for this specific
+# Prasanga.
 PHOTOS = [
+    {"src": "assets/prasanga-flyer.jpg",
+     "caption": "Prasanga — Sri Devi Mahathme | October 3, 2026"},
     {"src": "assets/photos/yakshagana-on-stage.jpg",
      "caption": "Yakshagana on stage — dance, drama, and devotion"},
     {"src": "assets/photos/yakshagana-krishna.jpg",
@@ -357,12 +362,12 @@ def qr_prefix() -> str:
 # CHECKIN_LEAD_HOURS before the event start by default (see utils.checkin_status
 # for the persistent admin override that can force it open/closed).
 
-EVENT_TIMEZONE = "America/Chicago"  # TODO: update to venue timezone
-EVENT_START_LOCAL = datetime(2027, 1, 1, 17, 30)  # TODO: update to event start time
+EVENT_TIMEZONE = "America/Chicago"
+EVENT_START_LOCAL = datetime(2026, 10, 3, 17, 0)  # 5:00 PM onwards
 CHECKIN_LEAD_HOURS = 2
 
 # Used only if the system tz database is unavailable (see _event_start_local_aware).
-# America/Chicago is UTC-5 (CDT) for the whole lead-up to an October event.
+# America/Chicago is UTC-5 (CDT) for an October event.
 _FALLBACK_UTC_OFFSET_HOURS = 5
 
 

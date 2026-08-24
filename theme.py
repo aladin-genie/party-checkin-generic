@@ -1738,10 +1738,14 @@ def hero() -> str:
     else:
         theme_html = ""
 
+    subtitle = html.escape(getattr(config, "EVENT_SUBTITLE", "") or "")
+    subtitle_html = f'<div class="hero-subtitle">{subtitle}</div>' if subtitle else ""
+
     return f"""
     <div class="hero-banner">
         <div class="hero-title">{html.escape(config.EVENT_NAME)}</div>
         <div class="hero-subtitle">{html.escape(config.EVENT_TAGLINE)}</div>
+        {subtitle_html}
         {local_html}
         {theme_html}
         <div class="hero-badges">
@@ -1768,11 +1772,14 @@ def event_strip() -> str:
     theme_html = (
         f'<span class="event-strip-theme">🎭 {theme_name} Theme</span>' if theme_name else ""
     )
+    subtitle = html.escape(getattr(config, "EVENT_SUBTITLE", "") or "")
+    subtitle_html = f'<span class="event-strip-date">🎭 {subtitle}</span>' if subtitle else ""
     return (
         '<div class="event-strip">'
         f'<span class="event-strip-date">📅 {html.escape(config.EVENT_DATE_SHORT)}'
         f' · {html.escape(config.EVENT_TIME_TEXT)}</span>'
-        f'<span class="event-strip-venue">📍 {html.escape(config.VENUE_NAME)}</span>'
+        f'{subtitle_html}'
+        f'<span class="event-strip-venue">📍 {html.escape(config.VENUE_NAME)}, {html.escape(config.VENUE_ADDRESS)}</span>'
         f'{theme_html}'
         '</div>'
     )
@@ -2233,6 +2240,9 @@ def payment_card(zelle_info: str, tiers: list, ticket_count: int = 0) -> str:
         <p class="payment-desc">
             Before registering, send your payment via Zelle in your banking app.
             You'll need the <strong>transaction confirmation number</strong> on the next step.
+            <br><br>
+            <strong>Kids under age 12 are FREE</strong> — do not buy them a seat.
+            Food will be available for purchase at the venue.
         </p>
         <div class="zelle-box">
             <div class="zelle-label">Send Zelle To</div>
@@ -2417,46 +2427,39 @@ def guest_names_requirement(ticket_count: int, provided: int = 0) -> str:
 
 
 def food_count_requirement(ticket_count: int, veg_count: int = 0, non_veg_count: int = 0) -> str:
-    """The live note telling the guest whether their meal counts match their tickets.
+    """The live note summarising meal preferences for catering planning.
 
-    Meal counts double as a per-person catering tally, so veg + non-veg must
-    equal ticket_count exactly — same reasoning, and the same visual
-    treatment, as guest_names_requirement() above. `ticket_count`,
-    `veg_count`, and `non_veg_count` are all the current widget values (the
-    counters live outside the form, so this re-renders live as they change).
+    Food is available for purchase at the venue, so veg + non-veg may be 0 up
+    to ticket_count. The note only flags when more meals are entered than
+    tickets. `ticket_count`, `veg_count`, and `non_veg_count` are all the
+    current widget values (the counters live outside the form, so this
+    re-renders live as they change).
     """
     tickets = int(ticket_count)
     veg = int(veg_count)
     non_veg = int(non_veg_count)
     total = veg + non_veg
 
-    if total == tickets:
+    if total <= tickets:
         return (
             '<div class="guest-req is-solo">'
             '<span class="guest-req-icon">🍽️</span>'
-            f"<span>{veg} veg, {non_veg} non-veg — matches your {tickets} "
-            f"ticket{'s' if tickets != 1 else ''}.</span>"
+            f"<span>{veg} veg, {non_veg} non-veg — planning food for {total} of "
+            f"{tickets} attendees.</span>"
             "</div>"
         )
 
-    meals_word = "meal" if tickets == 1 else "meals"
-    if total < tickets:
-        missing = tickets - total
-        detail = (
-            f"you're {missing} {'meal' if missing == 1 else 'meals'} short — please add "
-            f"{'it' if missing == 1 else 'them'}."
-        )
-    else:
-        excess = total - tickets
-        detail = (
-            f"that's {excess} {'meal' if excess == 1 else 'meals'} too many — please remove "
-            f"{'it' if excess == 1 else 'them'}."
-        )
+    excess = total - tickets
+    detail = (
+        f"that's {excess} {'meal' if excess == 1 else 'meals'} too many — please remove "
+        f"{'it' if excess == 1 else 'them'}."
+    )
     return (
         '<div class="guest-req">'
         '<span class="guest-req-icon">🍽️</span>'
-        f"<span>{tickets} tickets needs <strong>{tickets} {meals_word} total</strong> — "
-        f"you've entered <span class=\"guest-req-count\">{total}</span> "
+        f"<span>{tickets} ticket{'s' if tickets != 1 else ''} cannot need more than "
+        f"<strong>{tickets} meals</strong> — you've entered "
+        f"<span class=\"guest-req-count\">{total}</span> "
         f"({veg} veg + {non_veg} non-veg), so {html.escape(detail)}</span>"
         "</div>"
     )

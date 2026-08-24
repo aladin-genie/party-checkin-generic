@@ -2427,10 +2427,9 @@ def validate_registration(
         errors["ticket_count"] = f"Please choose between 1 and {max_tickets} tickets."
         tickets_clean = min(max(tickets_clean, 1), max_tickets)
 
-    # Meal counts double as a per-person catering tally, so they must add up
-    # to exactly the number of tickets bought — not more, not fewer. Garbage
-    # input coerces to 0, same style as ticket_count above: a fixable
-    # message, not a traceback out of int().
+    # Meal preferences are collected for catering planning. Food is available
+    # for purchase at the venue, so veg + non-veg may be anywhere from 0 up to
+    # the number of tickets bought — but never more than the party size.
     try:
         veg_clean = int(veg_count)
     except (TypeError, ValueError):
@@ -2445,22 +2444,13 @@ def validate_registration(
         non_veg_clean = max(non_veg_clean, 0)
 
     food_total = veg_clean + non_veg_clean
-    if "food_count" not in errors and food_total != tickets_clean:
-        meals_word = "meal" if tickets_clean == 1 else "meals"
-        if food_total < tickets_clean:
-            missing = tickets_clean - food_total
-            errors["food_count"] = (
-                f"{tickets_clean} tickets needs {tickets_clean} {meals_word} total, but you "
-                f"entered {food_total} ({veg_clean} veg + {non_veg_clean} non-veg). "
-                f"Please add {missing} more {'meal' if missing == 1 else 'meals'}."
-            )
-        else:
-            excess = food_total - tickets_clean
-            errors["food_count"] = (
-                f"{tickets_clean} tickets needs {tickets_clean} {meals_word} total, but you "
-                f"entered {food_total} ({veg_clean} veg + {non_veg_clean} non-veg). "
-                f"Please remove {excess} {'meal' if excess == 1 else 'meals'}."
-            )
+    if "food_count" not in errors and food_total > tickets_clean:
+        excess = food_total - tickets_clean
+        errors["food_count"] = (
+            f"You have {tickets_clean} ticket{'s' if tickets_clean != 1 else ''} but entered "
+            f"{food_total} meals ({veg_clean} veg + {non_veg_clean} non-veg). "
+            f"Please remove {excess} {'meal' if excess == 1 else 'meals'}."
+        )
 
     names, names_reason = parse_guest_names(plus_one_name or "")
     expected = additional_guests_expected(tickets_clean)
