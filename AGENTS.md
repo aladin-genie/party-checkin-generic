@@ -25,6 +25,21 @@ cd /tmp/pc-sandbox && python -m streamlit run /path/to/party-checkin/streamlit_a
 
 The `tests/e2e` suite does exactly this automatically.
 
+## ⛔ Never point a test at the production database host
+
+Supabase network-bans an IP after a few failed password attempts. A local
+script that connects to the REAL project host (`db.<ref>.supabase.co` or the
+pooler) with a fabricated password will get the developer's home IP banned —
+this has already happened once, and it locks you out of the dashboard and the
+DB from that network until you clear it under
+**Project Settings → Database → Network Bans**.
+
+When testing connection-failure handling, use a host that cannot belong to
+anyone: `10.255.255.1` (unroutable, produces a real connect timeout),
+`localhost:1`, or `sqlite:///` plus a patched `get_db`. Never the live ref,
+not even with a deliberately wrong password — *especially* not with a wrong
+password.
+
 ## Live App
 - **Streamlit Cloud:** see Streamlit Cloud dashboard (URL kept out of this public repo — it was getting hit by
   crawler/bot traffic every few minutes after being indexed from here, inflating the visitor stats)
