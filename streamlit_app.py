@@ -517,6 +517,12 @@ def page_register():
     # landing page — a guest arriving from the flyer may never see Home's hero.
     st.markdown(theme.event_strip(), unsafe_allow_html=True)
 
+    # The event flyer, collapsed so it doesn't push the form below the fold.
+    flyer_src = utils.event_flyer_src()
+    if flyer_src:
+        with st.expander("📜 View event flyer", expanded=False):
+            st.markdown(theme.flyer_card(flyer_src), unsafe_allow_html=True)
+
     # ── Zelle Payment Info Card ────────────────────────────────────────────
     # Carries the whole group-discount table, with the row for the current
     # selection highlighted. It has to render BEFORE the selector (that's
